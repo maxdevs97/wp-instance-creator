@@ -141,6 +141,53 @@
       display: block;
     }
     
+    .status.queued {
+      background: #fff3cd;
+      border: 1px solid #ffeeba;
+      color: #856404;
+      display: block;
+    }
+    
+    .progress-container {
+      margin-top: 15px;
+    }
+    
+    .progress-step {
+      padding: 8px 12px;
+      margin: 6px 0;
+      border-radius: 6px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #f8f9fa;
+      color: #333;
+    }
+    
+    .progress-step.active {
+      background: #d1ecf1;
+      border: 1px solid #bee5eb;
+      color: #0c5460;
+      font-weight: 600;
+    }
+    
+    .progress-step.completed {
+      background: #d4edda;
+      border: 1px solid #c3e6cb;
+      color: #155724;
+    }
+    
+    .progress-step.error {
+      background: #f8d7da;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+    }
+    
+    .step-icon {
+      font-size: 16px;
+      min-width: 20px;
+    }
+    
     .log-container {
       margin-top: 15px;
       max-height: 300px;
@@ -177,6 +224,8 @@
       justify-content: space-between;
       padding: 8px 0;
       border-bottom: 1px solid #e9ecef;
+      flex-wrap: wrap;
+      gap: 8px;
     }
     
     .result-item:last-child {
@@ -192,6 +241,7 @@
       color: #667eea;
       font-family: 'Courier New', monospace;
       font-size: 13px;
+      word-break: break-all;
     }
     
     .result-value a {
@@ -215,6 +265,16 @@
       vertical-align: middle;
     }
     
+    .spinner-small {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(12, 84, 96, 0.3);
+      border-radius: 50%;
+      border-top-color: #0c5460;
+      animation: spin 0.8s linear infinite;
+    }
+    
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
@@ -231,6 +291,20 @@
     
     #mainForm.unlocked {
       display: block;
+    }
+    
+    .job-info {
+      background: #f8f9fa;
+      padding: 10px 12px;
+      border-radius: 6px;
+      margin-bottom: 15px;
+      font-size: 13px;
+      color: #666;
+    }
+    
+    .job-info strong {
+      color: #333;
+      font-family: 'Courier New', monospace;
     }
   </style>
 </head>
@@ -293,6 +367,8 @@
   
   <script>
     let formPassword = '';
+    let pollInterval = null;
+    let currentJobId = null;
     
     function updateDomainPreview() {
       const subdomain = document.getElementById('subdomain').value;
@@ -335,6 +411,192 @@
       }
     }
     
+    function stopPolling() {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    }
+    
+    async function pollJobStatus(jobId) {
+      try {
+        const response = await fetch(`/api/status/${jobId}`);
+        const data = await response.json();
+        
+        if (!data.success) {
+          stopPolling();
+          showError('Failed to fetch job status');
+          return;
+        }
+        
+        const job = data.job;
+        updateStatusDisplay(job);
+        
+        // Stop polling if job is completed or failed
+        if (job.status === 'completed' || job.status === 'failed') {
+          stopPolling();
+        }
+      } catch (error) {
+        console.error('Polling error:', error);
+      }
+    }
+    
+    function updateStatusDisplay(job) {
+      const statusEl = document.getElementById('status');
+      
+      if (job.status === 'pending') {
+        statusEl.className = 'status queued';
+        statusEl.innerHTML = `
+          <div class="job-info">Job ID: <strong>${job.id}</strong></div>
+          <strong>⏳ Queued</strong><br>
+          Your job is queued and will start processing shortly...
+        `;
+      } else if (job.status === 'processing') {
+        statusEl.className = 'status processing';
+        
+        let html = `
+          <div class="job-info">Job ID: <strong>${job.id}</strong></div>
+          <strong><span class="spinner-small"></span> Processing...</strong><br>
+          <div style="margin-top: 8px; font-size: 13px;">
+            Current step: <strong>${job.progress.step}</strong><br>
+            ${job.progress.message}
+          </div>
+        `;
+        
+        if (job.progress.steps && job.progress.steps.length > 0) {
+          html += '<div class="progress-container">';
+          
+          const stepGroups = {
+            'snapshot': ['snapshot_start', 'snapshot_initiated', 'snapshot_waiting', 'snapshot_complete', 'snapshot_found'],
+            'droplet': ['droplet_start', 'droplet_created', 'droplet_waiting', 'droplet_active'],
+            'dns': ['dns_start', 'dns_updated', 'dns_created'],
+            'ssh': ['ssh_wait', 'ssh_connect', 'ssh_complete', 'ssh_warnings'],
+            'verify': ['verify_start', 'verify_success', 'verify_warning']
+          };
+          
+          const completedSteps = new Set(job.progress.steps.map(s => s.step));
+          const currentStep = job.progress.step;
+          
+          for (const [group, steps] of Object.entries(stepGroups)) {
+            const groupCompleted = steps.some(s => completedSteps.has(s));
+            const groupActive = steps.includes(currentStep);
+            const groupDone = steps.every(s => completedSteps.has(s) || s === currentStep);
+            
+            let icon = '⏹';
+            let className = 'progress-step';
+            let label = group.charAt(0).toUpperCase() + group.slice(1);
+            
+            if (groupActive) {
+              icon = '⏳';
+              className = 'progress-step active';
+            } else if (groupDone && groupCompleted) {
+              icon = '✓';
+              className = 'progress-step completed';
+            } else if (groupCompleted) {
+              icon = '🔄';
+              className = 'progress-step active';
+            }
+            
+            html += `<div class="${className}"><span class="step-icon">${icon}</span>${label}</div>`;
+          }
+          
+          html += '</div>';
+        }
+        
+        html += `<div style="margin-top: 12px; font-size: 12px; color: #666;">
+          ⏱ Processing typically takes 8-12 minutes. This page auto-updates every 10 seconds.
+        </div>`;
+        
+        statusEl.innerHTML = html;
+      } else if (job.status === 'completed') {
+        statusEl.className = 'status success';
+        
+        let html = `
+          <div class="job-info">Job ID: <strong>${job.id}</strong></div>
+          <strong>✅ Success!</strong> WordPress instance created.
+        `;
+        
+        if (job.result) {
+          html += '<div class="result-details">';
+          html += '<h3>🎉 Your Site is Ready!</h3>';
+          html += `<div class="result-item">
+            <span class="result-label">Live URL:</span>
+            <span class="result-value"><a href="https://${job.result.domain}" target="_blank">${job.result.domain}</a></span>
+          </div>`;
+          html += `<div class="result-item">
+            <span class="result-label">Admin Login:</span>
+            <span class="result-value"><a href="${job.result.wpAdminUrl}" target="_blank">${job.result.wpAdminUrl}</a></span>
+          </div>`;
+          html += `<div class="result-item">
+            <span class="result-label">Username:</span>
+            <span class="result-value">${job.result.wpAdminUser}</span>
+          </div>`;
+          html += `<div class="result-item">
+            <span class="result-label">Droplet IP:</span>
+            <span class="result-value">${job.result.dropletIp}</span>
+          </div>`;
+          html += `<div class="result-item">
+            <span class="result-label">Droplet ID:</span>
+            <span class="result-value">${job.result.dropletId}</span>
+          </div>`;
+          html += '</div>';
+        }
+        
+        if (job.progress.steps && job.progress.steps.length > 0) {
+          html += '<div class="log-container">';
+          html += '<strong>Execution Log:</strong><br>';
+          job.progress.steps.forEach(step => {
+            const time = new Date(step.timestamp).toLocaleTimeString();
+            html += `<div class="log-entry">[${time}] ${escapeHtml(step.message)}</div>`;
+          });
+          html += '</div>';
+        }
+        
+        statusEl.innerHTML = html;
+        
+        // Re-enable form for next instance
+        document.getElementById('submitBtn').disabled = false;
+        document.getElementById('submitBtn').textContent = 'Create Another Instance';
+      } else if (job.status === 'failed') {
+        statusEl.className = 'status error';
+        
+        let html = `
+          <div class="job-info">Job ID: <strong>${job.id}</strong></div>
+          <strong>❌ Error:</strong> ${escapeHtml(job.error || 'Instance creation failed')}
+        `;
+        
+        if (job.progress.steps && job.progress.steps.length > 0) {
+          html += '<div class="log-container">';
+          html += '<strong>Execution Log:</strong><br>';
+          job.progress.steps.forEach(step => {
+            const time = new Date(step.timestamp).toLocaleTimeString();
+            html += `<div class="log-entry">[${time}] ${escapeHtml(step.message)}</div>`;
+          });
+          html += '</div>';
+        }
+        
+        html += '<div style="margin-top: 12px; padding: 10px; background: white; border-radius: 6px; font-size: 13px;">';
+        html += '<strong>Need help?</strong><br>';
+        html += 'Contact support with Job ID: <code>' + job.id + '</code>';
+        html += '</div>';
+        
+        statusEl.innerHTML = html;
+        
+        // Re-enable form
+        document.getElementById('submitBtn').disabled = false;
+        document.getElementById('submitBtn').textContent = 'Try Again';
+      }
+    }
+    
+    function showError(message) {
+      const statusEl = document.getElementById('status');
+      statusEl.className = 'status error';
+      statusEl.innerHTML = `<strong>❌ Error:</strong> ${escapeHtml(message)}`;
+      
+      document.getElementById('submitBtn').disabled = false;
+      document.getElementById('submitBtn').textContent = 'Create WordPress Instance';
+    }
+    
     async function createInstance(event) {
       event.preventDefault();
       
@@ -343,13 +605,16 @@
       const submitBtn = document.getElementById('submitBtn');
       const statusEl = document.getElementById('status');
       
+      // Stop any existing polling
+      stopPolling();
+      
       // Disable form
       submitBtn.disabled = true;
-      submitBtn.innerHTML = '<span class="spinner"></span>Creating instance...';
+      submitBtn.textContent = 'Submitting...';
       
-      // Show processing status
+      // Show initial status
       statusEl.className = 'status processing';
-      statusEl.innerHTML = '<strong>⏳ Processing...</strong><br>This may take 5-10 minutes. Please wait...';
+      statusEl.innerHTML = '<strong>📤 Submitting...</strong><br>Creating your instance job...';
       
       try {
         const response = await fetch('/api/create-instance', {
@@ -364,75 +629,42 @@
         
         const data = await response.json();
         
-        if (data.success) {
-          // Success
-          statusEl.className = 'status success';
+        if (data.success && data.jobId) {
+          currentJobId = data.jobId;
           
-          let html = '<strong>✅ Success!</strong> WordPress instance created.<br>';
+          // Show initial success
+          statusEl.className = 'status queued';
+          statusEl.innerHTML = `
+            <div class="job-info">Job ID: <strong>${data.jobId}</strong></div>
+            <strong>✅ Instance creation started!</strong><br>
+            <div style="margin-top: 8px;">
+              Your WordPress instance is being created in the background.<br>
+              This page will auto-update every 10 seconds with progress.
+            </div>
+            <div style="margin-top: 12px; font-size: 12px; color: #666;">
+              ⏱ Estimated time: 8-12 minutes
+            </div>
+          `;
           
-          if (data.details) {
-            html += '<div class="result-details">';
-            html += '<h3>Instance Details</h3>';
-            html += `<div class="result-item">
-              <span class="result-label">Domain:</span>
-              <span class="result-value"><a href="https://${data.details.domain}" target="_blank">${data.details.domain}</a></span>
-            </div>`;
-            html += `<div class="result-item">
-              <span class="result-label">Admin URL:</span>
-              <span class="result-value"><a href="${data.details.wpAdminUrl}" target="_blank">${data.details.wpAdminUrl}</a></span>
-            </div>`;
-            html += `<div class="result-item">
-              <span class="result-label">Admin User:</span>
-              <span class="result-value">${data.details.wpAdminUser}</span>
-            </div>`;
-            html += `<div class="result-item">
-              <span class="result-label">Droplet IP:</span>
-              <span class="result-value">${data.details.dropletIp}</span>
-            </div>`;
-            html += `<div class="result-item">
-              <span class="result-label">Droplet ID:</span>
-              <span class="result-value">${data.details.dropletId}</span>
-            </div>`;
-            html += '</div>';
-          }
+          // Start polling every 10 seconds
+          pollInterval = setInterval(() => {
+            pollJobStatus(currentJobId);
+          }, 10000);
           
-          if (data.log && data.log.length > 0) {
-            html += '<div class="log-container">';
-            data.log.forEach(msg => {
-              html += `<div class="log-entry">${escapeHtml(msg)}</div>`;
-            });
-            html += '</div>';
-          }
-          
-          statusEl.innerHTML = html;
+          // Immediate first poll
+          setTimeout(() => pollJobStatus(currentJobId), 2000);
           
           // Reset form
-          document.getElementById('mainForm').reset();
+          document.getElementById('subdomain').value = '';
+          document.getElementById('wpPassword').value = '';
           updateDomainPreview();
           
         } else {
-          // Error
-          statusEl.className = 'status error';
-          
-          let html = `<strong>❌ Error:</strong> ${escapeHtml(data.message)}`;
-          
-          if (data.log && data.log.length > 0) {
-            html += '<div class="log-container">';
-            data.log.forEach(msg => {
-              html += `<div class="log-entry">${escapeHtml(msg)}</div>`;
-            });
-            html += '</div>';
-          }
-          
-          statusEl.innerHTML = html;
+          showError(data.message || 'Failed to start instance creation');
         }
         
       } catch (error) {
-        statusEl.className = 'status error';
-        statusEl.innerHTML = `<strong>❌ Error:</strong> ${escapeHtml(error.message)}`;
-      } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Create WordPress Instance';
+        showError(error.message);
       }
     }
     
@@ -447,6 +679,11 @@
       if (e.key === 'Enter') {
         unlockForm();
       }
+    });
+    
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      stopPolling();
     });
   </script>
 </body>

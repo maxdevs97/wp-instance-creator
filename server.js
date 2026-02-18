@@ -2,6 +2,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { Client } = require('ssh2');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
@@ -17,6 +18,67 @@ const FORM_PASSWORD = process.env.FORM_PASSWORD;
 const SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY;
 const TEMPLATE_DROPLET_ID = '551293569';
 const DOMAIN = 'sherstaging.com';
+
+// In-memory job queue
+const jobs = new Map();
+
+// Job status structure
+function createJob(jobId, subdomain) {
+  return {
+    id: jobId,
+    subdomain,
+    status: 'pending', // pending, processing, completed, failed
+    progress: {
+      step: 'queued',
+      message: 'Job queued, waiting to start...',
+      steps: []
+    },
+    result: null,
+    error: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function updateJobProgress(jobId, step, message, status = null) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  
+  job.progress.step = step;
+  job.progress.message = message;
+  job.progress.steps.push({
+    step,
+    message,
+    timestamp: new Date().toISOString()
+  });
+  
+  if (status) {
+    job.status = status;
+  }
+  
+  job.updatedAt = new Date().toISOString();
+  console.log(`[Job ${jobId}] ${step}: ${message}`);
+}
+
+function completeJob(jobId, result) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  
+  job.status = 'completed';
+  job.result = result;
+  job.updatedAt = new Date().toISOString();
+  console.log(`[Job ${jobId}] Completed successfully`);
+}
+
+function failJob(jobId, error) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  
+  job.status = 'failed';
+  job.error = error;
+  job.updatedAt = new Date().toISOString();
+  console.error(`[Job ${jobId}] Failed:`, error);
+}
 
 // DigitalOcean API helper
 async function doApiCall(endpoint, method = 'GET', body = null) {
@@ -45,105 +107,114 @@ async function doApiCall(endpoint, method = 'GET', body = null) {
 // Sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// SSH command executor
-async function sshExecute(host, commands) {
-  return new Promise((resolve, reject) => {
-    const conn = new Client();
-    const results = [];
-    
-    conn.on('ready', () => {
-      console.log(`SSH connected to ${host}`);
+// SSH command executor with retry logic
+async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`SSH attempt ${attempt}/${maxRetries} to ${host}`);
       
-      const executeCommand = (index) => {
-        if (index >= commands.length) {
+      return await new Promise((resolve, reject) => {
+        const conn = new Client();
+        const results = [];
+        let connectionTimeout;
+        
+        // Set a 60-second connection timeout
+        connectionTimeout = setTimeout(() => {
           conn.end();
-          resolve(results);
-          return;
-        }
+          reject(new Error('SSH connection timeout after 60 seconds'));
+        }, 60000);
         
-        const cmd = commands[index];
-        console.log(`Executing: ${cmd}`);
-        
-        conn.exec(cmd, (err, stream) => {
-          if (err) {
-            conn.end();
-            reject(err);
-            return;
-          }
+        conn.on('ready', () => {
+          clearTimeout(connectionTimeout);
+          console.log(`SSH connected to ${host}`);
           
-          let stdout = '';
-          let stderr = '';
+          const executeCommand = (index) => {
+            if (index >= commands.length) {
+              conn.end();
+              resolve(results);
+              return;
+            }
+            
+            const cmd = commands[index];
+            console.log(`Executing: ${cmd}`);
+            
+            conn.exec(cmd, (err, stream) => {
+              if (err) {
+                conn.end();
+                reject(err);
+                return;
+              }
+              
+              let stdout = '';
+              let stderr = '';
+              
+              stream.on('data', (data) => {
+                stdout += data.toString();
+              });
+              
+              stream.stderr.on('data', (data) => {
+                stderr += data.toString();
+              });
+              
+              stream.on('close', (code) => {
+                results.push({ cmd, stdout, stderr, code });
+                executeCommand(index + 1);
+              });
+            });
+          };
           
-          stream.on('data', (data) => {
-            stdout += data.toString();
-          });
-          
-          stream.stderr.on('data', (data) => {
-            stderr += data.toString();
-          });
-          
-          stream.on('close', (code) => {
-            results.push({ cmd, stdout, stderr, code });
-            executeCommand(index + 1);
-          });
+          executeCommand(0);
         });
-      };
+        
+        conn.on('error', (err) => {
+          clearTimeout(connectionTimeout);
+          reject(err);
+        });
+        
+        conn.on('timeout', () => {
+          clearTimeout(connectionTimeout);
+          conn.end();
+          reject(new Error('SSH connection timeout'));
+        });
+        
+        conn.connect({
+          host,
+          port: 22,
+          username: 'root',
+          privateKey: SSH_PRIVATE_KEY,
+          readyTimeout: 50000, // 50 seconds for ready event
+          timeout: 60000 // 60 seconds overall timeout
+        });
+      });
       
-      executeCommand(0);
-    });
-    
-    conn.on('error', (err) => {
-      reject(err);
-    });
-    
-    conn.connect({
-      host,
-      port: 22,
-      username: 'root',
-      privateKey: SSH_PRIVATE_KEY
-    });
-  });
+    } catch (error) {
+      lastError = error;
+      console.error(`SSH attempt ${attempt} failed:`, error.message);
+      
+      if (attempt < maxRetries) {
+        console.log(`Waiting ${retryDelay/1000}s before retry...`);
+        await sleep(retryDelay);
+      }
+    }
+  }
+  
+  throw new Error(`SSH failed after ${maxRetries} attempts: ${lastError.message}`);
 }
 
-// Password verification endpoint
-app.post('/api/verify-password', (req, res) => {
-  const { password } = req.body;
-  
-  if (password === FORM_PASSWORD) {
-    res.json({ success: true });
-  } else {
-    res.status(401).json({ success: false, message: 'Invalid password' });
-  }
-});
-
-// Main endpoint: Create WordPress instance
-app.post('/api/create-instance', async (req, res) => {
-  const { subdomain, wpAdminPassword, password } = req.body;
-  
-  // Verify password
-  if (password !== FORM_PASSWORD) {
-    return res.status(401).json({ success: false, message: 'Invalid password' });
-  }
-  
-  // Validate inputs
-  if (!subdomain || !wpAdminPassword) {
-    return res.status(400).json({ success: false, message: 'Missing required fields' });
-  }
-  
-  // Validate subdomain format
-  if (!/^[a-z0-9-]+$/.test(subdomain)) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Invalid subdomain format. Use only lowercase letters, numbers, and hyphens.' 
-    });
-  }
-  
-  const fullDomain = `${subdomain}.${DOMAIN}`;
-  const logMessages = [];
+// Background job processor
+async function processJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
   
   try {
+    job.status = 'processing';
+    const { subdomain, wpAdminPassword } = job.metadata;
+    const fullDomain = `${subdomain}.${DOMAIN}`;
+    
     // Step 1: Create snapshot of template droplet
-    logMessages.push('Creating snapshot of template droplet...');
+    updateJobProgress(jobId, 'snapshot_start', 'Creating snapshot of template droplet...');
     const snapshotName = `wp-snapshot-${subdomain}-${Date.now()}`;
     
     const snapshotResponse = await doApiCall(
@@ -153,10 +224,10 @@ app.post('/api/create-instance', async (req, res) => {
     );
     
     const actionId = snapshotResponse.action.id;
-    logMessages.push(`Snapshot creation initiated (Action ID: ${actionId})`);
+    updateJobProgress(jobId, 'snapshot_initiated', `Snapshot creation initiated (Action ID: ${actionId})`);
     
     // Wait for snapshot to complete
-    logMessages.push('Waiting for snapshot to complete...');
+    updateJobProgress(jobId, 'snapshot_waiting', 'Waiting for snapshot to complete (this may take 3-5 minutes)...');
     let snapshotComplete = false;
     let attempts = 0;
     const maxAttempts = 60; // 10 minutes max
@@ -167,7 +238,7 @@ app.post('/api/create-instance', async (req, res) => {
       
       if (actionStatus.action.status === 'completed') {
         snapshotComplete = true;
-        logMessages.push('Snapshot completed successfully');
+        updateJobProgress(jobId, 'snapshot_complete', 'Snapshot completed successfully');
       } else if (actionStatus.action.status === 'errored') {
         throw new Error('Snapshot creation failed');
       }
@@ -186,10 +257,10 @@ app.post('/api/create-instance', async (req, res) => {
       throw new Error('Snapshot not found after creation');
     }
     
-    logMessages.push(`Snapshot ID: ${snapshot.id}`);
+    updateJobProgress(jobId, 'snapshot_found', `Snapshot ID: ${snapshot.id}`);
     
     // Step 2: Create new droplet from snapshot
-    logMessages.push('Creating new droplet from snapshot...');
+    updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
     const dropletResponse = await doApiCall('/droplets', 'POST', {
@@ -197,17 +268,17 @@ app.post('/api/create-instance', async (req, res) => {
       region: 'nyc3',
       size: 's-1vcpu-1gb',
       image: snapshot.id,
-      ssh_keys: [], // Will use existing keys from snapshot
+      ssh_keys: [],
       backups: false,
       ipv6: false,
       monitoring: true
     });
     
     const newDropletId = dropletResponse.droplet.id;
-    logMessages.push(`Droplet created (ID: ${newDropletId})`);
+    updateJobProgress(jobId, 'droplet_created', `Droplet created (ID: ${newDropletId})`);
     
     // Wait for droplet to be active
-    logMessages.push('Waiting for droplet to become active...');
+    updateJobProgress(jobId, 'droplet_waiting', 'Waiting for droplet to become active...');
     let dropletActive = false;
     attempts = 0;
     let dropletIp = null;
@@ -219,7 +290,7 @@ app.post('/api/create-instance', async (req, res) => {
       if (dropletStatus.droplet.status === 'active') {
         dropletActive = true;
         dropletIp = dropletStatus.droplet.networks.v4.find(n => n.type === 'public')?.ip_address;
-        logMessages.push(`Droplet active with IP: ${dropletIp}`);
+        updateJobProgress(jobId, 'droplet_active', `Droplet active with IP: ${dropletIp}`);
       }
       attempts++;
     }
@@ -229,39 +300,36 @@ app.post('/api/create-instance', async (req, res) => {
     }
     
     // Step 3: Configure DNS
-    logMessages.push('Configuring DNS A record...');
+    updateJobProgress(jobId, 'dns_start', 'Configuring DNS A record...');
     
-    // Check if record already exists
     const existingRecords = await doApiCall(`/domains/${DOMAIN}/records`);
     const existingRecord = existingRecords.domain_records.find(
       r => r.type === 'A' && r.name === subdomain
     );
     
     if (existingRecord) {
-      // Update existing record
       await doApiCall(
         `/domains/${DOMAIN}/records/${existingRecord.id}`,
         'PUT',
         { data: dropletIp }
       );
-      logMessages.push('Updated existing DNS A record');
+      updateJobProgress(jobId, 'dns_updated', 'Updated existing DNS A record');
     } else {
-      // Create new record
       await doApiCall(`/domains/${DOMAIN}/records`, 'POST', {
         type: 'A',
         name: subdomain,
         data: dropletIp,
         ttl: 300
       });
-      logMessages.push('Created new DNS A record');
+      updateJobProgress(jobId, 'dns_created', 'Created new DNS A record');
     }
     
-    // Step 4: Wait for SSH to be ready
-    logMessages.push('Waiting for SSH to be ready...');
-    await sleep(30000); // Wait 30 seconds for droplet to fully boot
+    // Step 4: Wait for SSH to be ready (extended wait)
+    updateJobProgress(jobId, 'ssh_wait', 'Waiting for SSH to be ready (60 seconds for cloud-init)...');
+    await sleep(60000); // Wait 60 seconds for droplet to fully boot and cloud-init to complete
     
-    // Step 5: SSH into droplet and configure
-    logMessages.push('Connecting via SSH to configure WordPress...');
+    // Step 5: SSH into droplet and configure with retry logic
+    updateJobProgress(jobId, 'ssh_connect', 'Connecting via SSH to configure WordPress (will retry if needed)...');
     
     const sshCommands = [
       // Update site URL in WordPress database
@@ -289,23 +357,20 @@ app.post('/api/create-instance', async (req, res) => {
       `systemctl restart nginx`
     ];
     
-    const sshResults = await sshExecute(dropletIp, sshCommands);
-    logMessages.push('WordPress configuration completed');
+    const sshResults = await sshExecute(dropletIp, sshCommands, 5, 10000);
+    updateJobProgress(jobId, 'ssh_complete', 'WordPress configuration completed via SSH');
     
     // Check for any command failures
     const failedCommands = sshResults.filter(r => r.code !== 0);
     if (failedCommands.length > 0) {
-      logMessages.push('Warning: Some commands had non-zero exit codes');
-      failedCommands.forEach(f => {
-        logMessages.push(`  - ${f.cmd}: exit code ${f.code}`);
-        if (f.stderr) logMessages.push(`    ${f.stderr}`);
-      });
+      updateJobProgress(jobId, 'ssh_warnings', `Warning: ${failedCommands.length} command(s) had non-zero exit codes`);
     }
     
     // Step 6: Verify site is accessible
-    logMessages.push(`Testing site accessibility at https://${fullDomain}...`);
+    updateJobProgress(jobId, 'verify_start', `Testing site accessibility at https://${fullDomain}...`);
     await sleep(5000); // Brief wait for nginx restart
     
+    let siteAccessible = false;
     try {
       const siteCheck = await fetch(`https://${fullDomain}`, { 
         timeout: 10000,
@@ -313,39 +378,129 @@ app.post('/api/create-instance', async (req, res) => {
       });
       
       if (siteCheck.ok) {
-        logMessages.push('✓ Site is accessible with SSL');
+        updateJobProgress(jobId, 'verify_success', '✓ Site is accessible with SSL');
+        siteAccessible = true;
       } else {
-        logMessages.push(`⚠ Site returned status ${siteCheck.status}`);
+        updateJobProgress(jobId, 'verify_warning', `⚠ Site returned status ${siteCheck.status}`);
       }
     } catch (error) {
-      logMessages.push(`⚠ Site check failed: ${error.message}`);
+      updateJobProgress(jobId, 'verify_warning', `⚠ Site check failed: ${error.message}`);
     }
     
-    // Success response
-    res.json({
-      success: true,
-      message: 'WordPress instance created successfully',
-      details: {
-        domain: fullDomain,
-        dropletId: newDropletId,
-        dropletIp,
-        snapshotId: snapshot.id,
-        wpAdminUrl: `https://${fullDomain}/wp-admin`,
-        wpAdminUser: 'clients@sheragency.com'
-      },
-      log: logMessages
+    // Complete job
+    completeJob(jobId, {
+      domain: fullDomain,
+      dropletId: newDropletId,
+      dropletIp,
+      snapshotId: snapshot.id,
+      wpAdminUrl: `https://${fullDomain}/wp-admin`,
+      wpAdminUser: 'clients@sheragency.com',
+      siteAccessible
     });
     
   } catch (error) {
-    console.error('Error creating instance:', error);
-    logMessages.push(`ERROR: ${error.message}`);
-    
-    res.status(500).json({
-      success: false,
-      message: error.message,
-      log: logMessages
+    console.error(`Job ${jobId} failed:`, error);
+    updateJobProgress(jobId, 'error', `ERROR: ${error.message}`, 'failed');
+    failJob(jobId, error.message);
+  }
+}
+
+// Password verification endpoint
+app.post('/api/verify-password', (req, res) => {
+  const { password } = req.body;
+  
+  if (password === FORM_PASSWORD) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ success: false, message: 'Invalid password' });
+  }
+});
+
+// Main endpoint: Create WordPress instance (now returns immediately with job ID)
+app.post('/api/create-instance', async (req, res) => {
+  const { subdomain, wpAdminPassword, password } = req.body;
+  
+  // Verify password
+  if (password !== FORM_PASSWORD) {
+    return res.status(401).json({ success: false, message: 'Invalid password' });
+  }
+  
+  // Validate inputs
+  if (!subdomain || !wpAdminPassword) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+  
+  // Validate subdomain format
+  if (!/^[a-z0-9-]+$/.test(subdomain)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Invalid subdomain format. Use only lowercase letters, numbers, and hyphens.' 
     });
   }
+  
+  // Create job
+  const jobId = uuidv4();
+  const job = createJob(jobId, subdomain);
+  job.metadata = { subdomain, wpAdminPassword };
+  jobs.set(jobId, job);
+  
+  // Start processing in background
+  processJob(jobId).catch(err => {
+    console.error(`Background job ${jobId} error:`, err);
+  });
+  
+  // Return immediately with job ID
+  res.json({
+    success: true,
+    jobId,
+    message: 'Instance creation started',
+    statusUrl: `/api/status/${jobId}`
+  });
+});
+
+// Status endpoint: Get job status
+app.get('/api/status/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = jobs.get(jobId);
+  
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      message: 'Job not found'
+    });
+  }
+  
+  // Return job status without sensitive metadata
+  res.json({
+    success: true,
+    job: {
+      id: job.id,
+      subdomain: job.subdomain,
+      status: job.status,
+      progress: job.progress,
+      result: job.result,
+      error: job.error,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt
+    }
+  });
+});
+
+// List all jobs (for debugging)
+app.get('/api/jobs', (req, res) => {
+  const jobList = Array.from(jobs.values()).map(job => ({
+    id: job.id,
+    subdomain: job.subdomain,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt
+  }));
+  
+  res.json({
+    success: true,
+    count: jobList.length,
+    jobs: jobList
+  });
 });
 
 // Health check endpoint
@@ -357,6 +512,13 @@ app.get('/api/health', (req, res) => {
       hasDoToken: !!DO_API_TOKEN,
       hasFormPassword: !!FORM_PASSWORD,
       hasSshKey: !!SSH_PRIVATE_KEY
+    },
+    stats: {
+      totalJobs: jobs.size,
+      pending: Array.from(jobs.values()).filter(j => j.status === 'pending').length,
+      processing: Array.from(jobs.values()).filter(j => j.status === 'processing').length,
+      completed: Array.from(jobs.values()).filter(j => j.status === 'completed').length,
+      failed: Array.from(jobs.values()).filter(j => j.status === 'failed').length
     }
   });
 });
