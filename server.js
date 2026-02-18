@@ -15,7 +15,22 @@ app.use(express.static('public'));
 // Configuration
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
-const SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY;
+
+// Fix SSH private key: convert escaped newlines to actual newlines
+// This handles DigitalOcean App Platform env vars that escape \n
+let SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY;
+if (SSH_PRIVATE_KEY) {
+  // Replace literal \n with actual newlines
+  SSH_PRIVATE_KEY = SSH_PRIVATE_KEY.replace(/\\n/g, '\n');
+  // Remove surrounding quotes if present
+  SSH_PRIVATE_KEY = SSH_PRIVATE_KEY.replace(/^["']|["']$/g, '');
+  console.log('SSH key processed:', {
+    hasBeginMarker: SSH_PRIVATE_KEY.includes('-----BEGIN'),
+    hasEndMarker: SSH_PRIVATE_KEY.includes('-----END'),
+    lineCount: SSH_PRIVATE_KEY.split('\n').length
+  });
+}
+
 const TEMPLATE_DROPLET_ID = '551293569';
 const DOMAIN = 'sherstaging.com';
 
@@ -128,7 +143,7 @@ async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
         
         conn.on('ready', () => {
           clearTimeout(connectionTimeout);
-          console.log(`SSH connected to ${host}`);
+          console.log(`✓ SSH handshake successful to ${host}`);
           
           const executeCommand = (index) => {
             if (index >= commands.length) {
@@ -170,22 +185,42 @@ async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
         
         conn.on('error', (err) => {
           clearTimeout(connectionTimeout);
+          console.error(`✗ SSH error on ${host}:`, {
+            message: err.message,
+            level: err.level,
+            code: err.code
+          });
           reject(err);
         });
         
         conn.on('timeout', () => {
           clearTimeout(connectionTimeout);
           conn.end();
+          console.error(`✗ SSH timeout on ${host}`);
           reject(new Error('SSH connection timeout'));
         });
         
+        conn.on('handshake', (negotiated) => {
+          console.log(`SSH handshake started with ${host}:`, {
+            kex: negotiated.kex,
+            serverHostKey: negotiated.serverHostKey
+          });
+        });
+        
+        console.log(`Attempting SSH connection to ${host}:22 as root...`);
         conn.connect({
           host,
           port: 22,
           username: 'root',
           privateKey: SSH_PRIVATE_KEY,
           readyTimeout: 50000, // 50 seconds for ready event
-          timeout: 60000 // 60 seconds overall timeout
+          timeout: 60000, // 60 seconds overall timeout
+          debug: (msg) => {
+            // Only log important debug messages
+            if (msg.includes('handshake') || msg.includes('authentication')) {
+              console.log(`SSH debug [${host}]:`, msg.substring(0, 200));
+            }
+          }
         });
       });
       
