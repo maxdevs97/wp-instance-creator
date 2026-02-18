@@ -19,7 +19,7 @@ const FORM_PASSWORD = process.env.FORM_PASSWORD;
 const WP_ADMIN_USER = process.env.WP_ADMIN_USER || 'clients@sheragency.com';
 const WP_APP_PASSWORD = process.env.WP_APP_PASSWORD; // Application Password from template
 
-const TEMPLATE_DROPLET_ID = '551293569';
+const TEMPLATE_DROPLET_ID = '552784281';
 const DOMAIN = 'sherstaging.com';
 
 // In-memory job queue
