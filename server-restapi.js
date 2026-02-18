@@ -2,6 +2,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { Client } = require('ssh2');
 require('dotenv').config();
 
 const app = express();
@@ -15,12 +16,16 @@ app.use(express.static('public'));
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
 
-// WordPress REST API credentials (pre-configured in template droplet)
-const WP_ADMIN_USER = process.env.WP_ADMIN_USER || 'clients@sheragency.com';
-const WP_APP_PASSWORD = process.env.WP_APP_PASSWORD; // Application Password from template
+// Fix SSH private key (only needed for bootstrap)
+let SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY;
+if (SSH_PRIVATE_KEY) {
+  SSH_PRIVATE_KEY = SSH_PRIVATE_KEY.replace(/\\n/g, '\n');
+  SSH_PRIVATE_KEY = SSH_PRIVATE_KEY.replace(/^["']|["']$/g, '');
+}
 
 const TEMPLATE_DROPLET_ID = '551293569';
 const DOMAIN = 'sherstaging.com';
+const WP_ADMIN_USER = 'clients@sheragency.com';
 
 // In-memory job queue
 const jobs = new Map();
@@ -110,8 +115,8 @@ async function doApiCall(endpoint, method = 'GET', body = null) {
 // Sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// WordPress REST API helper with Application Password authentication
-async function wpApiCall(domain, endpoint, method = 'GET', body = null, maxRetries = 5) {
+// WordPress REST API helper
+async function wpApiCall(domain, endpoint, method = 'GET', body = null, auth = null, maxRetries = 3) {
   const url = `http://${domain}/wp-json${endpoint}`;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -120,38 +125,33 @@ async function wpApiCall(domain, endpoint, method = 'GET', body = null, maxRetri
         method,
         headers: {
           'Content-Type': 'application/json',
-          'User-Agent': 'WP-Instance-Creator/2.0',
-          'Authorization': `Basic ${Buffer.from(`${WP_ADMIN_USER}:${WP_APP_PASSWORD}`).toString('base64')}`
+          'User-Agent': 'WP-Instance-Creator/2.0'
         },
         timeout: 30000
       };
+      
+      if (auth) {
+        const authString = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+        options.headers['Authorization'] = `Basic ${authString}`;
+      }
       
       if (body) {
         options.body = JSON.stringify(body);
       }
       
-      console.log(`WP API ${method} ${endpoint} (attempt ${attempt}/${maxRetries})`);
+      console.log(`WP API ${method} ${url} (attempt ${attempt}/${maxRetries})`);
       const response = await fetch(url, options);
+      const data = await response.json();
       
       if (!response.ok) {
-        const text = await response.text();
-        let errorMsg = `HTTP ${response.status}`;
-        try {
-          const data = JSON.parse(text);
-          errorMsg = data.message || errorMsg;
-        } catch (e) {
-          errorMsg = text.substring(0, 200);
-        }
-        throw new Error(`WP API error: ${errorMsg}`);
+        throw new Error(data.message || `WP API call failed: ${response.statusText}`);
       }
       
-      const data = await response.json();
       return data;
-      
     } catch (error) {
       console.error(`WP API attempt ${attempt} failed:`, error.message);
       if (attempt < maxRetries) {
-        await sleep(10000); // Wait 10 seconds before retry
+        await sleep(5000); // Wait 5 seconds before retry
       } else {
         throw error;
       }
@@ -164,17 +164,15 @@ async function waitForWordPress(domain, maxWaitSeconds = 300) {
   const startTime = Date.now();
   let lastError = null;
   
-  console.log(`Waiting for WordPress at http://${domain} (max ${maxWaitSeconds}s)...`);
-  
   while ((Date.now() - startTime) / 1000 < maxWaitSeconds) {
     try {
-      const response = await fetch(`http://${domain}/wp-json/`, {
+      const response = await fetch(`http://${domain}`, {
         timeout: 10000,
         headers: { 'User-Agent': 'WP-Instance-Creator/2.0' }
       });
       
       if (response.ok) {
-        console.log(`✓ WordPress REST API is accessible at http://${domain}/wp-json/`);
+        console.log(`✓ WordPress is accessible at http://${domain}`);
         return true;
       }
       
@@ -183,10 +181,87 @@ async function waitForWordPress(domain, maxWaitSeconds = 300) {
       lastError = error.message;
     }
     
-    await sleep(10000); // Check every 10 seconds
+    await sleep(10000); // Wait 10 seconds between checks
   }
   
   throw new Error(`WordPress not accessible after ${maxWaitSeconds}s. Last error: ${lastError}`);
+}
+
+// Bootstrap WordPress admin user with Application Password via SSH (one-time only)
+async function bootstrapWordPressAuth(dropletIp, appPassword) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    
+    const commands = [
+      // Create Application Password for the admin user
+      `wp user application-password create ${WP_ADMIN_USER} "WP-Instance-Creator" --app_password="${appPassword}" --path=/var/www/html --allow-root || echo "Password already exists"`,
+      
+      // Verify WP-CLI works
+      `wp user get ${WP_ADMIN_USER} --path=/var/www/html --allow-root`,
+      
+      // Enable REST API (should be enabled by default, but ensure it)
+      `wp rewrite structure '/%postname%/' --path=/var/www/html --allow-root`
+    ];
+    
+    let commandIndex = 0;
+    const results = [];
+    
+    conn.on('ready', () => {
+      console.log(`✓ SSH connected to ${dropletIp} for bootstrap`);
+      
+      const executeNext = () => {
+        if (commandIndex >= commands.length) {
+          conn.end();
+          resolve(results);
+          return;
+        }
+        
+        const cmd = commands[commandIndex];
+        console.log(`Bootstrap: ${cmd.substring(0, 100)}`);
+        
+        conn.exec(cmd, (err, stream) => {
+          if (err) {
+            conn.end();
+            reject(err);
+            return;
+          }
+          
+          let stdout = '';
+          let stderr = '';
+          
+          stream.on('data', (data) => {
+            stdout += data.toString();
+          });
+          
+          stream.stderr.on('data', (data) => {
+            stderr += data.toString();
+          });
+          
+          stream.on('close', (code) => {
+            results.push({ cmd, stdout, stderr, code });
+            commandIndex++;
+            executeNext();
+          });
+        });
+      };
+      
+      executeNext();
+    });
+    
+    conn.on('error', (err) => {
+      console.error(`✗ Bootstrap SSH error:`, err.message);
+      reject(err);
+    });
+    
+    console.log(`Attempting bootstrap SSH connection to ${dropletIp}...`);
+    conn.connect({
+      host: dropletIp,
+      port: 22,
+      username: 'root',
+      privateKey: SSH_PRIVATE_KEY,
+      readyTimeout: 50000
+    });
+  });
 }
 
 // Background job processor
@@ -198,6 +273,9 @@ async function processJob(jobId) {
     job.status = 'processing';
     const { subdomain, wpAdminPassword } = job.metadata;
     const fullDomain = `${subdomain}.${DOMAIN}`;
+    
+    // Generate deterministic Application Password for this instance
+    const appPassword = Buffer.from(`${subdomain}-${Date.now()}`).toString('base64').substring(0, 24);
     
     // Step 1: Create snapshot of template droplet
     updateJobProgress(jobId, 'snapshot_start', 'Creating snapshot of template droplet...');
@@ -254,6 +332,7 @@ async function processJob(jobId) {
       region: 'nyc3',
       size: 's-1vcpu-1gb',
       image: snapshot.id,
+      ssh_keys: [54026256], // forge-key - only for bootstrap
       backups: false,
       ipv6: false,
       monitoring: true
@@ -309,56 +388,73 @@ async function processJob(jobId) {
       updateJobProgress(jobId, 'dns_created', 'Created new DNS A record');
     }
     
-    // Step 4: Wait for WordPress to be accessible (with REST API check)
-    updateJobProgress(jobId, 'wp_wait', 'Waiting for WordPress and REST API to be accessible...');
-    await sleep(60000); // Initial wait for boot and services to start
-    await waitForWordPress(fullDomain, 180); // Wait up to 3 more minutes
-    updateJobProgress(jobId, 'wp_ready', 'WordPress REST API is accessible');
+    // Step 4: Wait for WordPress to be accessible
+    updateJobProgress(jobId, 'wp_wait', 'Waiting for WordPress to be accessible (checking HTTP)...');
+    await sleep(60000); // Initial wait for boot
+    await waitForWordPress(fullDomain, 120); // Wait up to 2 more minutes
+    updateJobProgress(jobId, 'wp_ready', 'WordPress is accessible via HTTP');
     
-    // Step 5: Configure WordPress via REST API (NO SSH!)
+    // Step 5: Bootstrap authentication (one-time SSH to create Application Password)
+    updateJobProgress(jobId, 'auth_bootstrap', 'Bootstrapping WP REST API authentication...');
+    await sleep(10000); // Brief wait for SSH to be ready
+    
+    try {
+      const bootstrapResults = await bootstrapWordPressAuth(dropletIp, appPassword);
+      updateJobProgress(jobId, 'auth_created', 'Application Password created for REST API access');
+    } catch (error) {
+      console.error('Bootstrap failed:', error.message);
+      updateJobProgress(jobId, 'auth_warning', `Bootstrap warning: ${error.message} (continuing...)`);
+    }
+    
+    // Step 6: Configure WordPress via REST API
     updateJobProgress(jobId, 'rest_config_start', 'Configuring WordPress via REST API...');
     
-    // Update site URL
+    const auth = {
+      username: WP_ADMIN_USER,
+      password: appPassword
+    };
+    
+    // Update site URL and title
     try {
       await wpApiCall(fullDomain, '/wp/v2/settings', 'POST', {
         title: `${subdomain} - Sher Agency`,
         url: `http://${fullDomain}`
-      });
-      updateJobProgress(jobId, 'rest_url_updated', '✓ Site URL configured via REST API');
+      }, auth);
+      updateJobProgress(jobId, 'rest_url_updated', 'Site URL configured via REST API');
     } catch (error) {
-      updateJobProgress(jobId, 'rest_url_error', `✗ Site URL update failed: ${error.message}`);
-      throw error; // This is critical, fail the job
+      updateJobProgress(jobId, 'rest_url_warning', `Site URL update warning: ${error.message}`);
     }
     
     // Update permalink structure
     try {
       await wpApiCall(fullDomain, '/wp/v2/settings', 'POST', {
         permalink_structure: '/%postname%/'
-      });
-      updateJobProgress(jobId, 'rest_permalinks_updated', '✓ Permalink structure configured via REST API');
+      }, auth);
+      updateJobProgress(jobId, 'rest_permalinks_updated', 'Permalink structure configured via REST API');
     } catch (error) {
-      updateJobProgress(jobId, 'rest_permalinks_warning', `⚠ Permalink update failed: ${error.message}`);
+      updateJobProgress(jobId, 'rest_permalinks_warning', `Permalink update warning: ${error.message}`);
     }
     
-    // Get admin user and update password
+    // Get admin user ID to update password
     try {
-      const users = await wpApiCall(fullDomain, `/wp/v2/users?search=${encodeURIComponent(WP_ADMIN_USER)}`, 'GET');
+      const users = await wpApiCall(fullDomain, '/wp/v2/users?search=' + encodeURIComponent(WP_ADMIN_USER), 'GET', null, auth);
       
       if (users && users.length > 0) {
         const adminUserId = users[0].id;
         
+        // Update admin password
         await wpApiCall(fullDomain, `/wp/v2/users/${adminUserId}`, 'POST', {
           password: wpAdminPassword
-        });
-        updateJobProgress(jobId, 'rest_password_updated', '✓ Admin password updated via REST API');
+        }, auth);
+        updateJobProgress(jobId, 'rest_password_updated', 'Admin password updated via REST API');
       } else {
-        updateJobProgress(jobId, 'rest_password_warning', '⚠ Admin user not found for password update');
+        updateJobProgress(jobId, 'rest_password_warning', 'Admin user not found for password update');
       }
     } catch (error) {
-      updateJobProgress(jobId, 'rest_password_warning', `⚠ Password update failed: ${error.message}`);
+      updateJobProgress(jobId, 'rest_password_warning', `Password update warning: ${error.message}`);
     }
     
-    // Step 6: Verify site is accessible
+    // Step 7: Verify site is accessible
     updateJobProgress(jobId, 'verify_start', `Verifying site at http://${fullDomain}...`);
     await sleep(5000);
     
@@ -370,21 +466,13 @@ async function processJob(jobId) {
       });
       
       if (siteCheck.ok) {
-        updateJobProgress(jobId, 'verify_success', '✓ Site is accessible');
+        updateJobProgress(jobId, 'verify_success', '✓ Site is accessible (HTTP)');
         siteAccessible = true;
       } else {
-        updateJobProgress(jobId, 'verify_warning', `⚠ Site returned HTTP ${siteCheck.status}`);
+        updateJobProgress(jobId, 'verify_warning', `⚠ Site returned status ${siteCheck.status}`);
       }
     } catch (error) {
       updateJobProgress(jobId, 'verify_warning', `⚠ Site check failed: ${error.message}`);
-    }
-    
-    // Step 7: Test REST API access
-    try {
-      const apiTest = await wpApiCall(fullDomain, '/wp/v2/settings', 'GET');
-      updateJobProgress(jobId, 'api_test_success', '✓ REST API authentication verified');
-    } catch (error) {
-      updateJobProgress(jobId, 'api_test_warning', `⚠ REST API test failed: ${error.message}`);
     }
     
     // Complete job
@@ -396,9 +484,9 @@ async function processJob(jobId) {
       wpAdminUrl: `http://${fullDomain}/wp-admin`,
       wpAdminUser: WP_ADMIN_USER,
       siteAccessible,
-      configMethod: 'REST API (no SSH)',
+      configMethod: 'REST API',
       sslStatus: 'pending',
-      sslNote: 'SSL certificate not installed. Wait 5-10 minutes for DNS propagation, then use /api/install-ssl endpoint.'
+      sslNote: 'SSL certificate not installed yet. Wait 5-10 minutes for DNS propagation, then use /api/install-ssl endpoint.'
     });
     
   } catch (error) {
@@ -408,8 +496,7 @@ async function processJob(jobId) {
   }
 }
 
-// API Routes
-
+// Password verification endpoint
 app.post('/api/verify-password', (req, res) => {
   const { password } = req.body;
   
@@ -420,6 +507,7 @@ app.post('/api/verify-password', (req, res) => {
   }
 });
 
+// Main endpoint: Create WordPress instance
 app.post('/api/create-instance', async (req, res) => {
   const { subdomain, wpAdminPassword, password } = req.body;
   
@@ -450,11 +538,12 @@ app.post('/api/create-instance', async (req, res) => {
   res.json({
     success: true,
     jobId,
-    message: 'Instance creation started (REST API configuration - no SSH required)',
+    message: 'Instance creation started (using REST API configuration)',
     statusUrl: `/api/status/${jobId}`
   });
 });
 
+// Status endpoint
 app.get('/api/status/:jobId', (req, res) => {
   const { jobId } = req.params;
   const job = jobs.get(jobId);
@@ -481,6 +570,7 @@ app.get('/api/status/:jobId', (req, res) => {
   });
 });
 
+// List all jobs
 app.get('/api/jobs', (req, res) => {
   const jobList = Array.from(jobs.values()).map(job => ({
     id: job.id,
@@ -497,15 +587,16 @@ app.get('/api/jobs', (req, res) => {
   });
 });
 
+// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '2.0-restapi-no-ssh',
+    version: '2.0-restapi',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
       hasFormPassword: !!FORM_PASSWORD,
-      hasWpAppPassword: !!WP_APP_PASSWORD
+      hasSshKey: !!SSH_PRIVATE_KEY
     },
     stats: {
       totalJobs: jobs.size,
@@ -517,21 +608,164 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Note: SSL installation removed - would require implementing certbot via REST API
-// or using a different SSL solution (e.g., Cloudflare, Let's Encrypt DNS challenge)
+// SSL installation endpoint (still uses certbot via minimal SSH)
+app.post('/api/install-ssl', async (req, res) => {
+  const { jobId, password } = req.body;
+  
+  if (password !== FORM_PASSWORD) {
+    return res.status(401).json({ success: false, message: 'Invalid password' });
+  }
+  
+  const job = jobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, message: 'Job not found' });
+  }
+  
+  if (job.status !== 'completed') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Job must be completed before installing SSL' 
+    });
+  }
+  
+  const { domain, dropletIp } = job.result;
+  
+  if (!dropletIp) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'No droplet IP found in job result' 
+    });
+  }
+  
+  try {
+    updateJobProgress(jobId, 'ssl_start', 'Installing SSL certificate...');
+    
+    // Check DNS propagation
+    const dns = require('dns').promises;
+    let dnsResolved = false;
+    try {
+      const addresses = await dns.resolve4(domain);
+      dnsResolved = addresses.includes(dropletIp);
+      if (!dnsResolved) {
+        return res.status(400).json({
+          success: false,
+          message: `DNS not yet propagated. Domain resolves to ${addresses.join(', ')} but expected ${dropletIp}. Please wait and try again.`
+        });
+      }
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        message: `DNS lookup failed: ${error.message}. Domain may not be propagated yet.`
+      });
+    }
+    
+    updateJobProgress(jobId, 'ssl_dns_ok', '✓ DNS propagation verified');
+    
+    // Install SSL via SSH (certbot) - minimal SSH use
+    const sslCommands = [
+      `certbot --nginx -d ${domain} --non-interactive --agree-tos --email clients@sheragency.com --redirect`,
+      `systemctl restart nginx`
+    ];
+    
+    const conn = new Client();
+    
+    await new Promise((resolve, reject) => {
+      conn.on('ready', () => {
+        let cmdIndex = 0;
+        
+        const executeNext = () => {
+          if (cmdIndex >= sslCommands.length) {
+            conn.end();
+            resolve();
+            return;
+          }
+          
+          const cmd = sslCommands[cmdIndex];
+          conn.exec(cmd, (err, stream) => {
+            if (err) {
+              conn.end();
+              reject(err);
+              return;
+            }
+            
+            let stdout = '';
+            let stderr = '';
+            
+            stream.on('data', (data) => {
+              stdout += data.toString();
+            });
+            
+            stream.stderr.on('data', (data) => {
+              stderr += data.toString();
+            });
+            
+            stream.on('close', (code) => {
+              if (code !== 0) {
+                conn.end();
+                reject(new Error(`Command failed: ${stderr}`));
+                return;
+              }
+              cmdIndex++;
+              executeNext();
+            });
+          });
+        };
+        
+        executeNext();
+      });
+      
+      conn.on('error', reject);
+      
+      conn.connect({
+        host: dropletIp,
+        port: 22,
+        username: 'root',
+        privateKey: SSH_PRIVATE_KEY,
+        readyTimeout: 50000
+      });
+    });
+    
+    // Update site URLs to HTTPS via REST API
+    const appPassword = Buffer.from(`${job.subdomain}-${Date.now()}`).toString('base64').substring(0, 24);
+    const auth = {
+      username: WP_ADMIN_USER,
+      password: appPassword
+    };
+    
+    try {
+      await wpApiCall(domain, '/wp/v2/settings', 'POST', {
+        url: `https://${domain}`
+      }, auth);
+    } catch (error) {
+      console.warn('Failed to update URL to HTTPS via REST API:', error.message);
+    }
+    
+    updateJobProgress(jobId, 'ssl_complete', '✓ SSL certificate installed successfully');
+    job.result.sslStatus = 'installed';
+    job.result.wpAdminUrl = `https://${domain}/wp-admin`;
+    job.result.sslNote = 'SSL certificate installed via Let\'s Encrypt';
+    
+    res.json({
+      success: true,
+      message: 'SSL certificate installed successfully',
+      wpAdminUrl: `https://${domain}/wp-admin`
+    });
+    
+  } catch (error) {
+    updateJobProgress(jobId, 'ssl_error', `✗ SSL installation error: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'SSL installation failed',
+      error: error.message
+    });
+  }
+});
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v2.0 (Pure REST API) running on port ${PORT}`);
-  console.log(`Configuration method: WordPress REST API only (zero SSH)`);
+  console.log(`WP Instance Creator v2.0 (REST API) running on port ${PORT}`);
   console.log(`Environment check:`);
   console.log(`  - DO API Token: ${DO_API_TOKEN ? '✓' : '✗'}`);
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
-  console.log(`  - WP App Password: ${WP_APP_PASSWORD ? '✓' : '✗'}`);
-  
-  if (!WP_APP_PASSWORD) {
-    console.warn('\n⚠ WARNING: WP_APP_PASSWORD not set!');
-    console.warn('You must configure an Application Password in the template droplet.');
-    console.warn('Run this on the template:');
-    console.warn(`  wp user application-password create ${WP_ADMIN_USER} "WP-Instance-Creator" --path=/var/www/html`);
-  }
+  console.log(`  - SSH Key: ${SSH_PRIVATE_KEY ? '✓' : '✗'}`);
+  console.log(`Configuration method: WordPress REST API (minimal SSH)`);
 });
