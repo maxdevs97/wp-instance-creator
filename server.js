@@ -268,7 +268,7 @@ async function processJob(jobId) {
       region: 'nyc3',
       size: 's-1vcpu-1gb',
       image: snapshot.id,
-      ssh_keys: [],
+      ssh_keys: [54026256], // forge-key - required for SSH access
       backups: false,
       ipv6: false,
       monitoring: true
