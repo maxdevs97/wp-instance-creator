@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WordPress Instance Creator</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    
+    .container {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      max-width: 600px;
+      width: 100%;
+      padding: 40px;
+    }
+    
+    h1 {
+      color: #333;
+      font-size: 28px;
+      margin-bottom: 10px;
+      text-align: center;
+    }
+    
+    .subtitle {
+      color: #666;
+      text-align: center;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    
+    .form-group {
+      margin-bottom: 20px;
+    }
+    
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #333;
+      font-weight: 500;
+      font-size: 14px;
+    }
+    
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 15px;
+      transition: border-color 0.3s;
+    }
+    
+    input[type="text"]:focus,
+    input[type="password"]:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    
+    .helper-text {
+      font-size: 12px;
+      color: #666;
+      margin-top: 5px;
+    }
+    
+    .domain-preview {
+      background: #f5f5f5;
+      padding: 10px 16px;
+      border-radius: 6px;
+      margin-top: 5px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      color: #667eea;
+      font-weight: 600;
+    }
+    
+    button {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+      margin-top: 10px;
+    }
+    
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+    }
+    
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    
+    .status {
+      margin-top: 25px;
+      padding: 16px;
+      border-radius: 8px;
+      display: none;
+    }
+    
+    .status.success {
+      background: #d4edda;
+      border: 1px solid #c3e6cb;
+      color: #155724;
+      display: block;
+    }
+    
+    .status.error {
+      background: #f8d7da;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+      display: block;
+    }
+    
+    .status.processing {
+      background: #d1ecf1;
+      border: 1px solid #bee5eb;
+      color: #0c5460;
+      display: block;
+    }
+    
+    .log-container {
+      margin-top: 15px;
+      max-height: 300px;
+      overflow-y: auto;
+      background: #f8f9fa;
+      padding: 12px;
+      border-radius: 6px;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    
+    .log-entry {
+      padding: 2px 0;
+      color: #333;
+    }
+    
+    .result-details {
+      margin-top: 15px;
+      background: white;
+      padding: 15px;
+      border-radius: 6px;
+      border: 1px solid #c3e6cb;
+    }
+    
+    .result-details h3 {
+      color: #155724;
+      font-size: 16px;
+      margin-bottom: 10px;
+    }
+    
+    .result-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #e9ecef;
+    }
+    
+    .result-item:last-child {
+      border-bottom: none;
+    }
+    
+    .result-label {
+      font-weight: 600;
+      color: #333;
+    }
+    
+    .result-value {
+      color: #667eea;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+    }
+    
+    .result-value a {
+      color: #667eea;
+      text-decoration: none;
+    }
+    
+    .result-value a:hover {
+      text-decoration: underline;
+    }
+    
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 3px solid rgba(255,255,255,.3);
+      border-radius: 50%;
+      border-top-color: white;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    .password-gate {
+      margin-bottom: 30px;
+      padding-bottom: 30px;
+      border-bottom: 2px solid #e0e0e0;
+    }
+    
+    #mainForm {
+      display: none;
+    }
+    
+    #mainForm.unlocked {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🚀 WordPress Instance Creator</h1>
+    <p class="subtitle">Clone mbstest1.sherstaging.com with automation</p>
+    
+    <!-- Password Gate -->
+    <div class="password-gate" id="passwordGate">
+      <div class="form-group">
+        <label for="gatePassword">Team Password</label>
+        <input 
+          type="password" 
+          id="gatePassword" 
+          placeholder="Enter team password"
+          autocomplete="off"
+        />
+        <div class="helper-text">Enter the team password to access the form</div>
+      </div>
+      <button onclick="unlockForm()">Unlock Form</button>
+    </div>
+    
+    <!-- Main Form (hidden until password verified) -->
+    <form id="mainForm" onsubmit="createInstance(event)">
+      <div class="form-group">
+        <label for="subdomain">Subdomain</label>
+        <input 
+          type="text" 
+          id="subdomain" 
+          placeholder="e.g., project1, clientname, demo"
+          pattern="[a-z0-9-]+"
+          required
+          oninput="updateDomainPreview()"
+        />
+        <div class="helper-text">Use only lowercase letters, numbers, and hyphens</div>
+        <div class="domain-preview" id="domainPreview">→ .sherstaging.com</div>
+      </div>
+      
+      <div class="form-group">
+        <label for="wpPassword">WordPress Admin Password</label>
+        <input 
+          type="password" 
+          id="wpPassword" 
+          placeholder="Enter strong password"
+          required
+          minlength="8"
+        />
+        <div class="helper-text">Username will be: clients@sheragency.com</div>
+      </div>
+      
+      <button type="submit" id="submitBtn">
+        Create WordPress Instance
+      </button>
+    </form>
+    
+    <!-- Status Display -->
+    <div class="status" id="status"></div>
+  </div>
+  
+  <script>
+    let formPassword = '';
+    
+    function updateDomainPreview() {
+      const subdomain = document.getElementById('subdomain').value;
+      const preview = document.getElementById('domainPreview');
+      
+      if (subdomain) {
+        preview.textContent = `→ ${subdomain}.sherstaging.com`;
+      } else {
+        preview.textContent = '→ .sherstaging.com';
+      }
+    }
+    
+    async function unlockForm() {
+      const password = document.getElementById('gatePassword').value;
+      
+      if (!password) {
+        alert('Please enter the team password');
+        return;
+      }
+      
+      try {
+        const response = await fetch('/api/verify-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+          formPassword = password;
+          document.getElementById('passwordGate').style.display = 'none';
+          document.getElementById('mainForm').classList.add('unlocked');
+        } else {
+          alert('Invalid password. Please try again.');
+          document.getElementById('gatePassword').value = '';
+        }
+      } catch (error) {
+        alert('Error verifying password: ' + error.message);
+      }
+    }
+    
+    async function createInstance(event) {
+      event.preventDefault();
+      
+      const subdomain = document.getElementById('subdomain').value.trim().toLowerCase();
+      const wpPassword = document.getElementById('wpPassword').value;
+      const submitBtn = document.getElementById('submitBtn');
+      const statusEl = document.getElementById('status');
+      
+      // Disable form
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spinner"></span>Creating instance...';
+      
+      // Show processing status
+      statusEl.className = 'status processing';
+      statusEl.innerHTML = '<strong>⏳ Processing...</strong><br>This may take 5-10 minutes. Please wait...';
+      
+      try {
+        const response = await fetch('/api/create-instance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subdomain,
+            wpAdminPassword: wpPassword,
+            password: formPassword
+          })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+          // Success
+          statusEl.className = 'status success';
+          
+          let html = '<strong>✅ Success!</strong> WordPress instance created.<br>';
+          
+          if (data.details) {
+            html += '<div class="result-details">';
+            html += '<h3>Instance Details</h3>';
+            html += `<div class="result-item">
+              <span class="result-label">Domain:</span>
+              <span class="result-value"><a href="https://${data.details.domain}" target="_blank">${data.details.domain}</a></span>
+            </div>`;
+            html += `<div class="result-item">
+              <span class="result-label">Admin URL:</span>
+              <span class="result-value"><a href="${data.details.wpAdminUrl}" target="_blank">${data.details.wpAdminUrl}</a></span>
+            </div>`;
+            html += `<div class="result-item">
+              <span class="result-label">Admin User:</span>
+              <span class="result-value">${data.details.wpAdminUser}</span>
+            </div>`;
+            html += `<div class="result-item">
+              <span class="result-label">Droplet IP:</span>
+              <span class="result-value">${data.details.dropletIp}</span>
+            </div>`;
+            html += `<div class="result-item">
+              <span class="result-label">Droplet ID:</span>
+              <span class="result-value">${data.details.dropletId}</span>
+            </div>`;
+            html += '</div>';
+          }
+          
+          if (data.log && data.log.length > 0) {
+            html += '<div class="log-container">';
+            data.log.forEach(msg => {
+              html += `<div class="log-entry">${escapeHtml(msg)}</div>`;
+            });
+            html += '</div>';
+          }
+          
+          statusEl.innerHTML = html;
+          
+          // Reset form
+          document.getElementById('mainForm').reset();
+          updateDomainPreview();
+          
+        } else {
+          // Error
+          statusEl.className = 'status error';
+          
+          let html = `<strong>❌ Error:</strong> ${escapeHtml(data.message)}`;
+          
+          if (data.log && data.log.length > 0) {
+            html += '<div class="log-container">';
+            data.log.forEach(msg => {
+              html += `<div class="log-entry">${escapeHtml(msg)}</div>`;
+            });
+            html += '</div>';
+          }
+          
+          statusEl.innerHTML = html;
+        }
+        
+      } catch (error) {
+        statusEl.className = 'status error';
+        statusEl.innerHTML = `<strong>❌ Error:</strong> ${escapeHtml(error.message)}`;
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create WordPress Instance';
+      }
+    }
+    
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+    
+    // Allow Enter key on password gate
+    document.getElementById('gatePassword').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        unlockForm();
+      }
+    });
+  </script>
+</body>
+</html>

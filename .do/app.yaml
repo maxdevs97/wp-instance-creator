@@ -1,0 +1,26 @@
+name: wp-instance-creator
+region: nyc
+services:
+  - name: web
+    github:
+      repo: maxdevs97/wp-instance-creator
+      branch: main
+      deploy_on_push: true
+    build_command: npm install
+    run_command: npm start
+    environment_slug: node-js
+    http_port: 3000
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    routes:
+      - path: /
+    envs:
+      - key: DO_API_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: FORM_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+      - key: SSH_PRIVATE_KEY
+        scope: RUN_TIME
+        type: SECRET
