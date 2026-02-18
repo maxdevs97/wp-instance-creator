@@ -521,7 +521,7 @@
           html += '<h3>🎉 Your Site is Ready!</h3>';
           html += `<div class="result-item">
             <span class="result-label">Live URL:</span>
-            <span class="result-value"><a href="https://${job.result.domain}" target="_blank">${job.result.domain}</a></span>
+            <span class="result-value"><a href="http://${job.result.domain}" target="_blank">${job.result.domain}</a></span>
           </div>`;
           html += `<div class="result-item">
             <span class="result-label">Admin Login:</span>
@@ -539,6 +539,27 @@
             <span class="result-label">Droplet ID:</span>
             <span class="result-value">${job.result.dropletId}</span>
           </div>`;
+          
+          // SSL Status Display
+          if (job.result.sslStatus === 'pending') {
+            html += `<div class="result-item">
+              <span class="result-label">SSL Status:</span>
+              <span class="result-value" style="color: #856404;">⏳ Not yet installed</span>
+            </div>`;
+            html += `<div style="margin-top: 15px; padding: 12px; background: #fff3cd; border: 1px solid #ffeeba; border-radius: 6px; font-size: 13px; color: #856404;">
+              <strong>⚠️ SSL Certificate Pending</strong><br>
+              Your site is running on HTTP. Wait 5-10 minutes for DNS propagation, then click the button below to install SSL certificate.
+            </div>`;
+            html += `<button onclick="installSSL('${job.id}')" style="margin-top: 10px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+              🔒 Install SSL Certificate
+            </button>`;
+          } else if (job.result.sslStatus === 'installed') {
+            html += `<div class="result-item">
+              <span class="result-label">SSL Status:</span>
+              <span class="result-value" style="color: #28a745;">✓ Installed (HTTPS enabled)</span>
+            </div>`;
+          }
+          
           html += '</div>';
         }
         
@@ -665,6 +686,77 @@
         
       } catch (error) {
         showError(error.message);
+      }
+    }
+    
+    async function installSSL(jobId) {
+      const statusEl = document.getElementById('status');
+      
+      // Update status to show SSL installation in progress
+      statusEl.className = 'status processing';
+      statusEl.innerHTML = `
+        <div class="job-info">Job ID: <strong>${jobId}</strong></div>
+        <strong><span class="spinner-small"></span> Installing SSL...</strong><br>
+        <div style="margin-top: 8px; font-size: 13px;">
+          Checking DNS propagation and installing Let's Encrypt certificate...<br>
+          This may take 2-3 minutes.
+        </div>
+      `;
+      
+      try {
+        const response = await fetch('/api/install-ssl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jobId,
+            password: formPassword
+          })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+          // SSL installed successfully - refresh job status
+          await pollJobStatus(jobId);
+          
+          statusEl.className = 'status success';
+          const currentHTML = statusEl.innerHTML;
+          statusEl.innerHTML = currentHTML + `
+            <div style="margin-top: 15px; padding: 12px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 6px; font-size: 13px; color: #155724;">
+              <strong>✅ SSL Certificate Installed!</strong><br>
+              Your site is now secured with HTTPS. Visit: <a href="${data.wpAdminUrl}" target="_blank">${data.wpAdminUrl}</a>
+            </div>
+          `;
+        } else {
+          statusEl.className = 'status error';
+          statusEl.innerHTML = `
+            <div class="job-info">Job ID: <strong>${jobId}</strong></div>
+            <strong>❌ SSL Installation Failed</strong><br>
+            <div style="margin-top: 8px; font-size: 13px; background: white; padding: 10px; border-radius: 6px;">
+              ${escapeHtml(data.message)}<br><br>
+              ${data.error ? '<strong>Details:</strong><br>' + escapeHtml(data.error) : ''}
+            </div>
+            <div style="margin-top: 12px; font-size: 12px; color: #721c24;">
+              <strong>Common reasons:</strong><br>
+              • DNS hasn't propagated yet (wait 10-15 minutes)<br>
+              • Domain doesn't resolve to the correct IP<br>
+              • Firewall blocking port 80/443<br><br>
+              You can retry by refreshing this page or manually SSH into the droplet.
+            </div>
+            <button onclick="installSSL('${jobId}')" style="margin-top: 10px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+              🔄 Retry SSL Installation
+            </button>
+          `;
+        }
+      } catch (error) {
+        statusEl.className = 'status error';
+        statusEl.innerHTML = `
+          <div class="job-info">Job ID: <strong>${jobId}</strong></div>
+          <strong>❌ Error:</strong> ${escapeHtml(error.message)}<br>
+          <button onclick="installSSL('${jobId}')" style="margin-top: 10px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+            🔄 Retry SSL Installation
+          </button>
+        `;
       }
     }
     

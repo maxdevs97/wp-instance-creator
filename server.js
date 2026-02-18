@@ -122,8 +122,8 @@ async function doApiCall(endpoint, method = 'GET', body = null) {
 // Sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// SSH command executor with retry logic
-async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
+// SSH command executor with retry logic and per-command timeout
+async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000, commandTimeout = 30000) {
   let lastError = null;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -164,6 +164,14 @@ async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
               
               let stdout = '';
               let stderr = '';
+              let cmdTimedOut = false;
+              
+              // Set per-command timeout
+              const cmdTimeout = setTimeout(() => {
+                cmdTimedOut = true;
+                stream.close();
+                console.warn(`⚠ Command timed out after ${commandTimeout/1000}s: ${cmd.substring(0, 100)}`);
+              }, commandTimeout);
               
               stream.on('data', (data) => {
                 stdout += data.toString();
@@ -174,7 +182,14 @@ async function sshExecute(host, commands, maxRetries = 5, retryDelay = 10000) {
               });
               
               stream.on('close', (code) => {
-                results.push({ cmd, stdout, stderr, code });
+                clearTimeout(cmdTimeout);
+                results.push({ 
+                  cmd, 
+                  stdout, 
+                  stderr, 
+                  code: cmdTimedOut ? -1 : code,
+                  timedOut: cmdTimedOut 
+                });
                 executeCommand(index + 1);
               });
             });
@@ -367,12 +382,12 @@ async function processJob(jobId) {
     updateJobProgress(jobId, 'ssh_connect', 'Connecting via SSH to configure WordPress (will retry if needed)...');
     
     const sshCommands = [
-      // Update site URL in WordPress database
-      `mysql -u root -e "USE wordpress; UPDATE wp_options SET option_value='https://${fullDomain}' WHERE option_name IN ('siteurl', 'home');"`,
+      // Update site URL in WordPress database (use HTTP initially, SSL will be added later)
+      `mysql -u root -e "USE wordpress; UPDATE wp_options SET option_value='http://${fullDomain}' WHERE option_name IN ('siteurl', 'home');"`,
       
       // Update wp-config.php if needed
-      `sed -i "s|define( 'WP_HOME'.*|define( 'WP_HOME', 'https://${fullDomain}' );|g" /var/www/html/wp-config.php || true`,
-      `sed -i "s|define( 'WP_SITEURL'.*|define( 'WP_SITEURL', 'https://${fullDomain}' );|g" /var/www/html/wp-config.php || true`,
+      `sed -i "s|define( 'WP_HOME'.*|define( 'WP_HOME', 'http://${fullDomain}' );|g" /var/www/html/wp-config.php || true`,
+      `sed -i "s|define( 'WP_SITEURL'.*|define( 'WP_SITEURL', 'http://${fullDomain}' );|g" /var/www/html/wp-config.php || true`,
       
       // Set WP admin password
       `wp user update clients@sheragency.com --user_pass='${wpAdminPassword}' --path=/var/www/html --allow-root`,
@@ -384,9 +399,6 @@ async function processJob(jobId) {
       `find /var/www/html/wp-content/uploads -type f -exec chmod 644 {} \\;`,
       `find /var/www/html/wp-content/plugins -type d -exec chmod 755 {} \\;`,
       `find /var/www/html/wp-content/plugins -type f -exec chmod 644 {} \\;`,
-      
-      // Install SSL certificate
-      `certbot --nginx -d ${fullDomain} --non-interactive --agree-tos --email clients@sheragency.com --redirect`,
       
       // Restart nginx
       `systemctl restart nginx`
@@ -402,18 +414,18 @@ async function processJob(jobId) {
     }
     
     // Step 6: Verify site is accessible
-    updateJobProgress(jobId, 'verify_start', `Testing site accessibility at https://${fullDomain}...`);
+    updateJobProgress(jobId, 'verify_start', `Testing site accessibility at http://${fullDomain}...`);
     await sleep(5000); // Brief wait for nginx restart
     
     let siteAccessible = false;
     try {
-      const siteCheck = await fetch(`https://${fullDomain}`, { 
+      const siteCheck = await fetch(`http://${fullDomain}`, { 
         timeout: 10000,
         headers: { 'User-Agent': 'WP-Instance-Creator/1.0' }
       });
       
       if (siteCheck.ok) {
-        updateJobProgress(jobId, 'verify_success', '✓ Site is accessible with SSL');
+        updateJobProgress(jobId, 'verify_success', '✓ Site is accessible (HTTP only - SSL not yet installed)');
         siteAccessible = true;
       } else {
         updateJobProgress(jobId, 'verify_warning', `⚠ Site returned status ${siteCheck.status}`);
@@ -428,9 +440,11 @@ async function processJob(jobId) {
       dropletId: newDropletId,
       dropletIp,
       snapshotId: snapshot.id,
-      wpAdminUrl: `https://${fullDomain}/wp-admin`,
+      wpAdminUrl: `http://${fullDomain}/wp-admin`,
       wpAdminUser: 'clients@sheragency.com',
-      siteAccessible
+      siteAccessible,
+      sslStatus: 'pending',
+      sslNote: 'SSL certificate not installed yet. Wait 5-10 minutes for DNS propagation, then use /api/install-ssl endpoint or run manually: certbot --nginx -d ' + fullDomain + ' --non-interactive --agree-tos --email clients@sheragency.com --redirect'
     });
     
   } catch (error) {
@@ -556,6 +570,103 @@ app.get('/api/health', (req, res) => {
       failed: Array.from(jobs.values()).filter(j => j.status === 'failed').length
     }
   });
+});
+
+// SSL installation endpoint (to be called after DNS propagates)
+app.post('/api/install-ssl', async (req, res) => {
+  const { jobId, password } = req.body;
+  
+  // Verify password
+  if (password !== FORM_PASSWORD) {
+    return res.status(401).json({ success: false, message: 'Invalid password' });
+  }
+  
+  // Get job
+  const job = jobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, message: 'Job not found' });
+  }
+  
+  if (job.status !== 'completed') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Job must be completed before installing SSL' 
+    });
+  }
+  
+  const { domain, dropletIp } = job.result;
+  
+  if (!dropletIp) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'No droplet IP found in job result' 
+    });
+  }
+  
+  try {
+    updateJobProgress(jobId, 'ssl_start', 'Installing SSL certificate...');
+    
+    // Check if DNS has propagated
+    const dns = require('dns').promises;
+    let dnsResolved = false;
+    try {
+      const addresses = await dns.resolve4(domain);
+      dnsResolved = addresses.includes(dropletIp);
+      if (!dnsResolved) {
+        return res.status(400).json({
+          success: false,
+          message: `DNS not yet propagated. Domain resolves to ${addresses.join(', ')} but expected ${dropletIp}. Please wait and try again.`
+        });
+      }
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        message: `DNS lookup failed: ${error.message}. Domain may not be propagated yet.`
+      });
+    }
+    
+    updateJobProgress(jobId, 'ssl_dns_ok', '✓ DNS propagation verified');
+    
+    // Install SSL via SSH with longer timeout (certbot can take 2-3 minutes)
+    const sslCommands = [
+      `certbot --nginx -d ${domain} --non-interactive --agree-tos --email clients@sheragency.com --redirect`,
+      `mysql -u root -e "USE wordpress; UPDATE wp_options SET option_value='https://${domain}' WHERE option_name IN ('siteurl', 'home');"`,
+      `sed -i "s|define( 'WP_HOME', 'http://|define( 'WP_HOME', 'https://|g" /var/www/html/wp-config.php || true`,
+      `sed -i "s|define( 'WP_SITEURL', 'http://|define( 'WP_SITEURL', 'https://|g" /var/www/html/wp-config.php || true`,
+      `systemctl restart nginx`
+    ];
+    
+    const sslResults = await sshExecute(dropletIp, sslCommands, 3, 5000, 180000); // 3-minute timeout per command
+    
+    const certbotResult = sslResults[0];
+    if (certbotResult.code === 0) {
+      updateJobProgress(jobId, 'ssl_complete', '✓ SSL certificate installed successfully');
+      job.result.sslStatus = 'installed';
+      job.result.wpAdminUrl = `https://${domain}/wp-admin`;
+      job.result.sslNote = 'SSL certificate installed via Let\'s Encrypt';
+      
+      res.json({
+        success: true,
+        message: 'SSL certificate installed successfully',
+        wpAdminUrl: `https://${domain}/wp-admin`
+      });
+    } else {
+      updateJobProgress(jobId, 'ssl_failed', `✗ SSL installation failed: ${certbotResult.stderr}`);
+      res.status(500).json({
+        success: false,
+        message: 'SSL installation failed',
+        error: certbotResult.stderr
+      });
+    }
+    
+  } catch (error) {
+    updateJobProgress(jobId, 'ssl_error', `✗ SSL installation error: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'SSL installation failed',
+      error: error.message
+    });
+  }
 });
 
 app.listen(PORT, () => {
