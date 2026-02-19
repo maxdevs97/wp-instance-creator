@@ -344,18 +344,6 @@
         <div class="domain-preview" id="domainPreview">→ .sherstaging.com</div>
       </div>
       
-      <div class="form-group">
-        <label for="wpPassword">WordPress Admin Password</label>
-        <input 
-          type="password" 
-          id="wpPassword" 
-          placeholder="Enter strong password"
-          required
-          minlength="8"
-        />
-        <div class="helper-text">Username will be: clients@sheragency.com</div>
-      </div>
-      
       <button type="submit" id="submitBtn">
         Create WordPress Instance
       </button>
@@ -532,6 +520,10 @@
             <span class="result-value">${job.result.wpAdminUser}</span>
           </div>`;
           html += `<div class="result-item">
+            <span class="result-label">Password:</span>
+            <span class="result-value">(should appear in 1Password)</span>
+          </div>`;
+          html += `<div class="result-item">
             <span class="result-label">Droplet IP:</span>
             <span class="result-value">${job.result.dropletIp}</span>
           </div>`;
@@ -622,7 +614,6 @@
       event.preventDefault();
       
       const subdomain = document.getElementById('subdomain').value.trim().toLowerCase();
-      const wpPassword = document.getElementById('wpPassword').value;
       const submitBtn = document.getElementById('submitBtn');
       const statusEl = document.getElementById('status');
       
@@ -643,7 +634,6 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             subdomain,
-            wpAdminPassword: wpPassword,
             password: formPassword
           })
         });
@@ -677,7 +667,6 @@
           
           // Reset form
           document.getElementById('subdomain').value = '';
-          document.getElementById('wpPassword').value = '';
           updateDomainPreview();
           
         } else {

@@ -113,7 +113,7 @@ async function processJob(jobId) {
   
   try {
     job.status = 'processing';
-    const { subdomain, wpAdminPassword } = job.metadata;
+    const { subdomain } = job.metadata;
     const fullDomain = `${subdomain}.${DOMAIN}`;
     
     // Step 1: Use pre-made wildcard SSL snapshot (no need to create new snapshot each time)
@@ -245,14 +245,14 @@ app.post('/api/verify-password', (req, res) => {
 });
 
 app.post('/api/create-instance', async (req, res) => {
-  const { subdomain, wpAdminPassword, password } = req.body;
+  const { subdomain, password } = req.body;
   
   if (password !== FORM_PASSWORD) {
     return res.status(401).json({ success: false, message: 'Invalid password' });
   }
   
-  if (!subdomain || !wpAdminPassword) {
-    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  if (!subdomain) {
+    return res.status(400).json({ success: false, message: 'Missing required field: subdomain' });
   }
   
   if (!/^[a-z0-9-]+$/.test(subdomain)) {
@@ -264,7 +264,7 @@ app.post('/api/create-instance', async (req, res) => {
   
   const jobId = uuidv4();
   const job = createJob(jobId, subdomain);
-  job.metadata = { subdomain, wpAdminPassword };
+  job.metadata = { subdomain };
   jobs.set(jobId, job);
   
   processJob(jobId).catch(err => {
@@ -442,7 +442,7 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.2-wildcard-ssl',
+    version: '3.2.2-password-field-removal',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
@@ -460,7 +460,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.2-wildcard-ssl running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.2.2-password-field-removal running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
   console.log(`Environment check:`);
@@ -468,4 +468,5 @@ app.listen(PORT, () => {
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
   console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
   console.log(`HTTPS will work automatically after DNS propagation.`);
+  console.log(`Password management: Template password inherited, managed via 1Password.`);
 });
