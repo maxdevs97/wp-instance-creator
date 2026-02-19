@@ -1,6 +1,6 @@
 {
   "name": "wp-instance-creator",
-  "version": "3.2.3-password-preservation-fix",
+  "version": "3.2.4-password-expiry-fix",
   "description": "WordPress instance creator - clone droplet with automation",
   "main": "server.js",
   "scripts": {

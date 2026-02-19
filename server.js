@@ -15,7 +15,7 @@ app.use(express.static('public'));
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
 
-const TEMPLATE_SNAPSHOT_ID = '217711524'; // Wildcard SSL snapshot (*.sherstaging.com)
+const TEMPLATE_SNAPSHOT_ID = '217727089'; // Wildcard SSL snapshot (*.sherstaging.com)
 const DOMAIN = 'sherstaging.com';
 
 // In-memory job queue
@@ -124,13 +124,13 @@ async function processJob(jobId) {
     const dropletName = `wp-${subdomain}`;
     
     // Cloud-init user_data to preserve passwords from template snapshot
-    // This prevents cloud-init from resetting or modifying user accounts
+    // Explicitly disables password expiry enforcement at system level
     const userData = `#cloud-config
-chpasswd:
-  expire: false
-users:
-  - default
 preserve_hostname: false
+runcmd:
+  - chage -I -1 -m 0 -M 99999 -E -1 root
+  - sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   99999/' /etc/login.defs
+  - sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   0/' /etc/login.defs
 `;
     
     const dropletResponse = await doApiCall('/droplets', 'POST', {
@@ -453,7 +453,7 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.2.3-password-preservation-fix',
+    version: '3.2.4-password-expiry-fix',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
@@ -471,7 +471,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.2.3-password-preservation-fix running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.2.4-password-expiry-fix running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
   console.log(`Environment check:`);
