@@ -15,7 +15,7 @@ app.use(express.static('public'));
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
 
-const TEMPLATE_SNAPSHOT_ID = '217727089'; // Wildcard SSL snapshot (*.sherstaging.com)
+const TEMPLATE_DROPLET_ID = '552784281'; // wordpress-managed-20260212 (mbstest1.sherstaging.com)
 const DOMAIN = 'sherstaging.com';
 
 // In-memory job queue
@@ -106,6 +106,60 @@ async function doApiCall(endpoint, method = 'GET', body = null) {
 // Sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Snapshot creation helper
+async function createSnapshotFromTemplate(dropletId, snapshotName) {
+  console.log(`Creating snapshot "${snapshotName}" from droplet ${dropletId}...`);
+  
+  const response = await doApiCall(`/droplets/${dropletId}/actions`, 'POST', {
+    type: 'snapshot',
+    name: snapshotName
+  });
+  
+  return response.action;
+}
+
+// Wait for snapshot action to complete and return the snapshot
+async function waitForSnapshotCompletion(actionId, dropletId, snapshotName, maxWaitMinutes = 5) {
+  const maxAttempts = maxWaitMinutes * 6; // Check every 10 seconds
+  let attempts = 0;
+  
+  console.log(`Waiting for snapshot action ${actionId} to complete...`);
+  
+  // Wait for action to complete
+  while (attempts < maxAttempts) {
+    const actionData = await doApiCall(`/droplets/${dropletId}/actions/${actionId}`);
+    const action = actionData.action;
+    
+    console.log(`Action ${actionId} status: ${action.status}`);
+    
+    if (action.status === 'completed') {
+      console.log(`Snapshot action completed successfully`);
+      break;
+    } else if (action.status === 'errored') {
+      throw new Error('Snapshot action failed');
+    }
+    
+    await sleep(10000);
+    attempts++;
+  }
+  
+  if (attempts >= maxAttempts) {
+    throw new Error(`Snapshot action timed out after ${maxWaitMinutes} minutes`);
+  }
+  
+  // Find the created snapshot by name
+  console.log(`Looking for snapshot with name: ${snapshotName}`);
+  const snapshotsData = await doApiCall(`/droplets/${dropletId}/snapshots`);
+  const snapshot = snapshotsData.snapshots.find(s => s.name === snapshotName);
+  
+  if (!snapshot) {
+    throw new Error(`Snapshot ${snapshotName} not found after action completed`);
+  }
+  
+  console.log(`Found snapshot ${snapshot.id}`);
+  return snapshot;
+}
+
 // Background job processor
 async function processJob(jobId) {
   const job = jobs.get(jobId);
@@ -116,10 +170,23 @@ async function processJob(jobId) {
     const { subdomain } = job.metadata;
     const fullDomain = `${subdomain}.${DOMAIN}`;
     
-    // Step 1: Use pre-made wildcard SSL snapshot (no need to create new snapshot each time)
-    updateJobProgress(jobId, 'snapshot_ready', `Using template snapshot with wildcard SSL (ID: ${TEMPLATE_SNAPSHOT_ID})`);
+    // Step 1: Create fresh snapshot from template droplet
+    updateJobProgress(jobId, 'snapshot_start', `Creating fresh snapshot from template droplet (ID: ${TEMPLATE_DROPLET_ID})...`);
+    const snapshotName = `wp-template-${subdomain}-${Date.now()}`;
     
-    // Step 2: Create new droplet from template snapshot
+    let snapshot;
+    try {
+      const action = await createSnapshotFromTemplate(TEMPLATE_DROPLET_ID, snapshotName);
+      updateJobProgress(jobId, 'snapshot_created', `Snapshot action initiated (Action ID: ${action.id}), waiting for completion...`);
+      
+      // Wait for snapshot to be ready
+      snapshot = await waitForSnapshotCompletion(action.id, TEMPLATE_DROPLET_ID, snapshotName);
+      updateJobProgress(jobId, 'snapshot_ready', `Snapshot ready (ID: ${snapshot.id})`);
+    } catch (snapshotError) {
+      throw new Error(`Snapshot creation failed: ${snapshotError.message}`);
+    }
+    
+    // Step 2: Create new droplet from fresh snapshot
     updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
@@ -140,7 +207,7 @@ runcmd:
       name: dropletName,
       region: 'nyc3',
       size: 's-1vcpu-2gb',
-      image: parseInt(TEMPLATE_SNAPSHOT_ID),
+      image: parseInt(snapshot.id),
       ssh_keys: [54026256], // forge-key - Required for SSH to work without password auth
       backups: false,
       ipv6: false,
@@ -230,7 +297,9 @@ runcmd:
       domain: fullDomain,
       dropletId: newDropletId,
       dropletIp,
-      templateSnapshotId: TEMPLATE_SNAPSHOT_ID,
+      snapshotId: snapshot.id,
+      snapshotName: snapshot.name,
+      templateDropletId: TEMPLATE_DROPLET_ID,
       wpAdminUrl: `https://${fullDomain}/wp-admin`,
       httpUrl: `http://${fullDomain}`,
       wpAdminUser: 'clients@sheragency.com',
@@ -457,12 +526,13 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.2.5',
+    version: '3.3.0',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
       hasFormPassword: !!FORM_PASSWORD,
-      templateSnapshotId: TEMPLATE_SNAPSHOT_ID,
+      templateDropletId: TEMPLATE_DROPLET_ID,
+      snapshotMethod: 'dynamic (created at runtime)',
       authMethod: 'SSH keys only (password auth disabled)'
     },
     stats: {
@@ -476,15 +546,16 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.2.5 running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.3.0 running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
-  console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
+  console.log(`Template droplet: ${TEMPLATE_DROPLET_ID} (wordpress-managed-20260212)`);
+  console.log(`Snapshot method: Dynamic (fresh snapshot created for each instance)`);
   console.log(`Environment check:`);
   console.log(`  - DO API Token: ${DO_API_TOKEN ? '✓' : '✗'}`);
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
   console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
   console.log(`HTTPS will work automatically after DNS propagation.`);
   console.log(`Authentication: SSH keys only (password auth disabled in cloud-init)`);
-  console.log(`Fix v3.2.5: Disables password authentication to prevent DO forced password reset.`);
-  console.log(`DigitalOcean password emails can be safely ignored.`);
+  console.log(`v3.3.0: Dynamic snapshots ensure template changes propagate to new instances.`);
+  console.log(`Expected deployment time: 4-5 minutes (includes snapshot creation).`);
 });
