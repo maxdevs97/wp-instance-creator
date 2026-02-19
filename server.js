@@ -15,10 +15,6 @@ app.use(express.static('public'));
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
 
-// WordPress REST API credentials (pre-configured in template droplet)
-const WP_ADMIN_USER = process.env.WP_ADMIN_USER || 'clients@sheragency.com';
-const WP_APP_PASSWORD = process.env.WP_APP_PASSWORD; // Application Password from template
-
 const TEMPLATE_DROPLET_ID = '552784281';
 const DOMAIN = 'sherstaging.com';
 
@@ -109,85 +105,6 @@ async function doApiCall(endpoint, method = 'GET', body = null) {
 
 // Sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// WordPress REST API helper with Application Password authentication
-async function wpApiCall(domain, endpoint, method = 'GET', body = null, maxRetries = 5) {
-  const url = `http://${domain}/wp-json${endpoint}`;
-  
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const options = {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'WP-Instance-Creator/2.0',
-          'Authorization': `Basic ${Buffer.from(`${WP_ADMIN_USER}:${WP_APP_PASSWORD}`).toString('base64')}`
-        },
-        timeout: 30000
-      };
-      
-      if (body) {
-        options.body = JSON.stringify(body);
-      }
-      
-      console.log(`WP API ${method} ${endpoint} (attempt ${attempt}/${maxRetries})`);
-      const response = await fetch(url, options);
-      
-      if (!response.ok) {
-        const text = await response.text();
-        let errorMsg = `HTTP ${response.status}`;
-        try {
-          const data = JSON.parse(text);
-          errorMsg = data.message || errorMsg;
-        } catch (e) {
-          errorMsg = text.substring(0, 200);
-        }
-        throw new Error(`WP API error: ${errorMsg}`);
-      }
-      
-      const data = await response.json();
-      return data;
-      
-    } catch (error) {
-      console.error(`WP API attempt ${attempt} failed:`, error.message);
-      if (attempt < maxRetries) {
-        await sleep(10000); // Wait 10 seconds before retry
-      } else {
-        throw error;
-      }
-    }
-  }
-}
-
-// Wait for WordPress to be accessible
-async function waitForWordPress(domain, maxWaitSeconds = 300) {
-  const startTime = Date.now();
-  let lastError = null;
-  
-  console.log(`Waiting for WordPress at http://${domain} (max ${maxWaitSeconds}s)...`);
-  
-  while ((Date.now() - startTime) / 1000 < maxWaitSeconds) {
-    try {
-      const response = await fetch(`http://${domain}/wp-json/`, {
-        timeout: 10000,
-        headers: { 'User-Agent': 'WP-Instance-Creator/2.0' }
-      });
-      
-      if (response.ok) {
-        console.log(`✓ WordPress REST API is accessible at http://${domain}/wp-json/`);
-        return true;
-      }
-      
-      lastError = `HTTP ${response.status}`;
-    } catch (error) {
-      lastError = error.message;
-    }
-    
-    await sleep(10000); // Check every 10 seconds
-  }
-  
-  throw new Error(`WordPress not accessible after ${maxWaitSeconds}s. Last error: ${lastError}`);
-}
 
 // Background job processor
 async function processJob(jobId) {
@@ -309,56 +226,12 @@ async function processJob(jobId) {
       updateJobProgress(jobId, 'dns_created', 'Created new DNS A record');
     }
     
-    // Step 4: Wait for WordPress to be accessible (with REST API check)
-    updateJobProgress(jobId, 'wp_wait', 'Waiting for WordPress and REST API to be accessible...');
-    await sleep(60000); // Initial wait for boot and services to start
-    await waitForWordPress(fullDomain, 180); // Wait up to 3 more minutes
-    updateJobProgress(jobId, 'wp_ready', 'WordPress REST API is accessible');
+    // Step 4: Wait for DNS propagation and site to be accessible
+    updateJobProgress(jobId, 'dns_propagation', 'Waiting for DNS propagation...');
+    await sleep(30000); // Wait 30 seconds for DNS to propagate
+    updateJobProgress(jobId, 'dns_propagated', 'DNS propagation complete');
     
-    // Step 5: Configure WordPress via REST API (NO SSH!)
-    updateJobProgress(jobId, 'rest_config_start', 'Configuring WordPress via REST API...');
-    
-    // Update site URL
-    try {
-      await wpApiCall(fullDomain, '/wp/v2/settings', 'POST', {
-        title: `${subdomain} - Sher Agency`,
-        url: `http://${fullDomain}`
-      });
-      updateJobProgress(jobId, 'rest_url_updated', '✓ Site URL configured via REST API');
-    } catch (error) {
-      updateJobProgress(jobId, 'rest_url_error', `✗ Site URL update failed: ${error.message}`);
-      throw error; // This is critical, fail the job
-    }
-    
-    // Update permalink structure
-    try {
-      await wpApiCall(fullDomain, '/wp/v2/settings', 'POST', {
-        permalink_structure: '/%postname%/'
-      });
-      updateJobProgress(jobId, 'rest_permalinks_updated', '✓ Permalink structure configured via REST API');
-    } catch (error) {
-      updateJobProgress(jobId, 'rest_permalinks_warning', `⚠ Permalink update failed: ${error.message}`);
-    }
-    
-    // Get admin user and update password
-    try {
-      const users = await wpApiCall(fullDomain, `/wp/v2/users?search=${encodeURIComponent(WP_ADMIN_USER)}`, 'GET');
-      
-      if (users && users.length > 0) {
-        const adminUserId = users[0].id;
-        
-        await wpApiCall(fullDomain, `/wp/v2/users/${adminUserId}`, 'POST', {
-          password: wpAdminPassword
-        });
-        updateJobProgress(jobId, 'rest_password_updated', '✓ Admin password updated via REST API');
-      } else {
-        updateJobProgress(jobId, 'rest_password_warning', '⚠ Admin user not found for password update');
-      }
-    } catch (error) {
-      updateJobProgress(jobId, 'rest_password_warning', `⚠ Password update failed: ${error.message}`);
-    }
-    
-    // Step 6: Verify site is accessible
+    // Step 5: Verify site is accessible
     updateJobProgress(jobId, 'verify_start', `Verifying site at http://${fullDomain}...`);
     await sleep(5000);
     
@@ -379,14 +252,6 @@ async function processJob(jobId) {
       updateJobProgress(jobId, 'verify_warning', `⚠ Site check failed: ${error.message}`);
     }
     
-    // Step 7: Test REST API access
-    try {
-      const apiTest = await wpApiCall(fullDomain, '/wp/v2/settings', 'GET');
-      updateJobProgress(jobId, 'api_test_success', '✓ REST API authentication verified');
-    } catch (error) {
-      updateJobProgress(jobId, 'api_test_warning', `⚠ REST API test failed: ${error.message}`);
-    }
-    
     // Complete job
     completeJob(jobId, {
       domain: fullDomain,
@@ -394,11 +259,10 @@ async function processJob(jobId) {
       dropletIp,
       snapshotId: snapshot.id,
       wpAdminUrl: `http://${fullDomain}/wp-admin`,
-      wpAdminUser: WP_ADMIN_USER,
       siteAccessible,
-      configMethod: 'REST API (no SSH)',
-      sslStatus: 'pending',
-      sslNote: 'SSL certificate not installed. Wait 5-10 minutes for DNS propagation, then use /api/install-ssl endpoint.'
+      configNote: 'Site configuration can be completed manually via wp-admin',
+      sslStatus: 'not configured',
+      sslNote: 'SSL certificate not installed. Configure SSL manually or via Cloudflare.'
     });
     
   } catch (error) {
@@ -450,7 +314,7 @@ app.post('/api/create-instance', async (req, res) => {
   res.json({
     success: true,
     jobId,
-    message: 'Instance creation started (REST API configuration - no SSH required)',
+    message: 'Instance creation started (manual configuration required after completion)',
     statusUrl: `/api/status/${jobId}`
   });
 });
@@ -500,12 +364,11 @@ app.get('/api/jobs', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '2.0-restapi-no-ssh',
+    version: '3.0-no-rest-api',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
-      hasFormPassword: !!FORM_PASSWORD,
-      hasWpAppPassword: !!WP_APP_PASSWORD
+      hasFormPassword: !!FORM_PASSWORD
     },
     stats: {
       totalJobs: jobs.size,
@@ -517,21 +380,11 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Note: SSL installation removed - would require implementing certbot via REST API
-// or using a different SSL solution (e.g., Cloudflare, Let's Encrypt DNS challenge)
-
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v2.0 (Pure REST API) running on port ${PORT}`);
-  console.log(`Configuration method: WordPress REST API only (zero SSH)`);
+  console.log(`WP Instance Creator v3.0 running on port ${PORT}`);
+  console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Environment check:`);
   console.log(`  - DO API Token: ${DO_API_TOKEN ? '✓' : '✗'}`);
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
-  console.log(`  - WP App Password: ${WP_APP_PASSWORD ? '✓' : '✗'}`);
-  
-  if (!WP_APP_PASSWORD) {
-    console.warn('\n⚠ WARNING: WP_APP_PASSWORD not set!');
-    console.warn('You must configure an Application Password in the template droplet.');
-    console.warn('Run this on the template:');
-    console.warn(`  wp user application-password create ${WP_ADMIN_USER} "WP-Instance-Creator" --path=/var/www/html`);
-  }
+  console.log(`\nNote: Sites are created from template and ready to configure manually.`);
 });
