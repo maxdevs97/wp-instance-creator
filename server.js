@@ -259,10 +259,11 @@ async function processJob(jobId) {
       dropletIp,
       snapshotId: snapshot.id,
       wpAdminUrl: `http://${fullDomain}/wp-admin`,
+      wpAdminUser: 'clients@sheragency.com',
       siteAccessible,
       configNote: 'Site configuration can be completed manually via wp-admin',
-      sslStatus: 'not configured',
-      sslNote: 'SSL certificate not installed. Configure SSL manually or via Cloudflare.'
+      sslStatus: 'pending',
+      sslNote: 'Wait 5-10 minutes for DNS propagation, then install SSL certificate.'
     });
     
   } catch (error) {
@@ -361,10 +362,128 @@ app.get('/api/jobs', (req, res) => {
   });
 });
 
+app.post('/api/install-ssl', async (req, res) => {
+  const { jobId, password } = req.body;
+  
+  if (password !== FORM_PASSWORD) {
+    return res.status(401).json({ success: false, message: 'Invalid password' });
+  }
+  
+  if (!jobId) {
+    return res.status(400).json({ success: false, message: 'Missing jobId' });
+  }
+  
+  const job = jobs.get(jobId);
+  
+  if (!job) {
+    return res.status(404).json({ success: false, message: 'Job not found' });
+  }
+  
+  if (job.status !== 'completed') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Job must be completed before installing SSL' 
+    });
+  }
+  
+  if (!job.result || !job.result.dropletId || !job.result.domain) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Job result missing required data (dropletId, domain)' 
+    });
+  }
+  
+  try {
+    const { dropletId, domain } = job.result;
+    const fullDomain = domain;
+    
+    console.log(`[SSL Install] Starting SSL installation for ${fullDomain} (Droplet: ${dropletId})`);
+    
+    // Step 1: Get droplet IP
+    const dropletData = await doApiCall(`/droplets/${dropletId}`);
+    const dropletIp = dropletData.droplet.networks.v4.find(n => n.type === 'public')?.ip_address;
+    
+    if (!dropletIp) {
+      throw new Error('Could not find droplet IP address');
+    }
+    
+    console.log(`[SSL Install] Droplet IP: ${dropletIp}`);
+    
+    // Step 2: Verify DNS has propagated
+    console.log(`[SSL Install] Checking DNS propagation for ${fullDomain}...`);
+    
+    let dnsResolved = false;
+    let attempts = 0;
+    const maxDnsAttempts = 3;
+    
+    while (!dnsResolved && attempts < maxDnsAttempts) {
+      try {
+        const dnsCheck = await fetch(`http://${fullDomain}`, { 
+          timeout: 10000,
+          headers: { 'User-Agent': 'WP-Instance-Creator-SSL/2.0' }
+        });
+        
+        if (dnsCheck.ok || dnsCheck.status === 301 || dnsCheck.status === 302) {
+          dnsResolved = true;
+          console.log(`[SSL Install] DNS resolved successfully`);
+        }
+      } catch (error) {
+        console.log(`[SSL Install] DNS check attempt ${attempts + 1} failed: ${error.message}`);
+      }
+      
+      if (!dnsResolved) {
+        await sleep(3000);
+        attempts++;
+      }
+    }
+    
+    if (!dnsResolved) {
+      return res.json({
+        success: false,
+        message: 'DNS has not fully propagated yet',
+        error: 'The domain does not resolve to the droplet IP. Wait 10-15 minutes and try again.',
+        retryable: true
+      });
+    }
+    
+    // Step 3: Run certbot via SSH (we need SSH key for SSL installation)
+    // For now, return success with manual instructions since we don't have SSH access
+    // In production, you would SSH to the droplet and run: certbot --nginx -d ${fullDomain} --non-interactive --agree-tos -m admin@sheragency.com
+    
+    console.log(`[SSL Install] SSL installation requires manual setup or SSH automation`);
+    
+    // Update job result to indicate SSL is ready to be installed manually
+    job.result.sslStatus = 'manual_setup_required';
+    job.result.sslNote = `DNS propagated. To install SSL:\n\nSSH to droplet:\nssh root@${dropletIp}\n\nRun certbot:\ncertbot --nginx -d ${fullDomain} --non-interactive --agree-tos -m admin@sheragency.com`;
+    job.result.sslInstructions = {
+      step1: `SSH to droplet: ssh root@${dropletIp}`,
+      step2: `Run certbot: certbot --nginx -d ${fullDomain} --non-interactive --agree-tos -m admin@sheragency.com`,
+      step3: `Site will be accessible via HTTPS after certbot completes`
+    };
+    
+    return res.json({
+      success: false,
+      message: 'SSL installation requires manual setup (no SSH key configured)',
+      error: `DNS is ready. Please SSH to ${dropletIp} and run:\ncertbot --nginx -d ${fullDomain} --non-interactive --agree-tos -m admin@sheragency.com`,
+      wpAdminUrl: `https://${fullDomain}/wp-admin`,
+      manualSetup: true,
+      sslInstructions: job.result.sslInstructions
+    });
+    
+  } catch (error) {
+    console.error(`[SSL Install] Error:`, error);
+    return res.status(500).json({
+      success: false,
+      message: 'SSL installation failed',
+      error: error.message
+    });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.0-no-rest-api',
+    version: '3.1-fixed-username-ssl',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
