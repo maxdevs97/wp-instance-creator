@@ -1,6 +1,6 @@
 {
   "name": "wp-instance-creator",
-  "version": "3.2.2-password-field-removal",
+  "version": "3.2.3-password-preservation-fix",
   "description": "WordPress instance creator - clone droplet with automation",
   "main": "server.js",
   "scripts": {

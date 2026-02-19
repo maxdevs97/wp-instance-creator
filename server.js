@@ -123,6 +123,16 @@ async function processJob(jobId) {
     updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
+    // Cloud-init user_data to preserve passwords from template snapshot
+    // This prevents cloud-init from resetting or modifying user accounts
+    const userData = `#cloud-config
+chpasswd:
+  expire: false
+users:
+  - default
+preserve_hostname: false
+`;
+    
     const dropletResponse = await doApiCall('/droplets', 'POST', {
       name: dropletName,
       region: 'nyc3',
@@ -130,7 +140,8 @@ async function processJob(jobId) {
       image: parseInt(TEMPLATE_SNAPSHOT_ID),
       backups: false,
       ipv6: false,
-      monitoring: true
+      monitoring: true,
+      user_data: userData
     });
     
     const newDropletId = dropletResponse.droplet.id;
@@ -442,7 +453,7 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.2.2-password-field-removal',
+    version: '3.2.3-password-preservation-fix',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
@@ -460,7 +471,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.2.2-password-field-removal running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.2.3-password-preservation-fix running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
   console.log(`Environment check:`);
@@ -468,5 +479,6 @@ app.listen(PORT, () => {
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
   console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
   console.log(`HTTPS will work automatically after DNS propagation.`);
-  console.log(`Password management: Template password inherited, managed via 1Password.`);
+  console.log(`Password management: Template credentials preserved via cloud-init user_data.`);
+  console.log(`Fix: Prevents cloud-init from modifying user passwords on new droplets.`);
 });
