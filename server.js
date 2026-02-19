@@ -123,14 +123,17 @@ async function processJob(jobId) {
     updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
-    // Cloud-init user_data to preserve passwords from template snapshot
-    // Explicitly disables password expiry enforcement at system level
+    // Cloud-init user_data to DISABLE password authentication entirely
+    // Forces SSH key-only authentication to avoid DigitalOcean's password reset requirement
     const userData = `#cloud-config
 preserve_hostname: false
+ssh_pwauth: false
+password_authentication: no
 runcmd:
+  - sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - systemctl restart sshd
   - chage -I -1 -m 0 -M 99999 -E -1 root
-  - sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   99999/' /etc/login.defs
-  - sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   0/' /etc/login.defs
 `;
     
     const dropletResponse = await doApiCall('/droplets', 'POST', {
@@ -454,12 +457,13 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.2.5-ssh-key-fix',
+    version: '3.2.5',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
       hasFormPassword: !!FORM_PASSWORD,
-      templateSnapshotId: TEMPLATE_SNAPSHOT_ID
+      templateSnapshotId: TEMPLATE_SNAPSHOT_ID,
+      authMethod: 'SSH keys only (password auth disabled)'
     },
     stats: {
       totalJobs: jobs.size,
@@ -472,7 +476,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.2.5-ssh-key-fix running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.2.5 running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
   console.log(`Environment check:`);
@@ -480,6 +484,7 @@ app.listen(PORT, () => {
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
   console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
   console.log(`HTTPS will work automatically after DNS propagation.`);
-  console.log(`Password management: Template credentials preserved via cloud-init user_data.`);
-  console.log(`Fix: Prevents cloud-init from modifying user passwords on new droplets.`);
+  console.log(`Authentication: SSH keys only (password auth disabled in cloud-init)`);
+  console.log(`Fix v3.2.5: Disables password authentication to prevent DO forced password reset.`);
+  console.log(`DigitalOcean password emails can be safely ignored.`);
 });
