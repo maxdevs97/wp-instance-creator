@@ -139,6 +139,7 @@ async function processJob(jobId) {
     // Wait for droplet to be active
     updateJobProgress(jobId, 'droplet_waiting', 'Waiting for droplet to become active...');
     let dropletActive = false;
+    const maxAttempts = 60; // 10 minutes max (60 attempts * 10 seconds)
     attempts = 0;
     let dropletIp = null;
     
