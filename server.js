@@ -15,7 +15,7 @@ app.use(express.static('public'));
 const DO_API_TOKEN = process.env.DO_API_TOKEN;
 const FORM_PASSWORD = process.env.FORM_PASSWORD;
 
-const TEMPLATE_DROPLET_ID = '552784281';
+const TEMPLATE_SNAPSHOT_ID = '217711524'; // Wildcard SSL snapshot (*.sherstaging.com)
 const DOMAIN = 'sherstaging.com';
 
 // In-memory job queue
@@ -116,53 +116,10 @@ async function processJob(jobId) {
     const { subdomain, wpAdminPassword } = job.metadata;
     const fullDomain = `${subdomain}.${DOMAIN}`;
     
-    // Step 1: Create snapshot of template droplet
-    updateJobProgress(jobId, 'snapshot_start', 'Creating snapshot of template droplet...');
-    const snapshotName = `wp-snapshot-${subdomain}-${Date.now()}`;
+    // Step 1: Use pre-made wildcard SSL snapshot (no need to create new snapshot each time)
+    updateJobProgress(jobId, 'snapshot_ready', `Using template snapshot with wildcard SSL (ID: ${TEMPLATE_SNAPSHOT_ID})`);
     
-    const snapshotResponse = await doApiCall(
-      `/droplets/${TEMPLATE_DROPLET_ID}/actions`,
-      'POST',
-      { type: 'snapshot', name: snapshotName }
-    );
-    
-    const actionId = snapshotResponse.action.id;
-    updateJobProgress(jobId, 'snapshot_initiated', `Snapshot creation initiated (Action ID: ${actionId})`);
-    
-    // Wait for snapshot to complete
-    updateJobProgress(jobId, 'snapshot_waiting', 'Waiting for snapshot to complete (3-5 minutes)...');
-    let snapshotComplete = false;
-    let attempts = 0;
-    const maxAttempts = 60;
-    
-    while (!snapshotComplete && attempts < maxAttempts) {
-      await sleep(10000);
-      const actionStatus = await doApiCall(`/actions/${actionId}`);
-      
-      if (actionStatus.action.status === 'completed') {
-        snapshotComplete = true;
-        updateJobProgress(jobId, 'snapshot_complete', 'Snapshot completed successfully');
-      } else if (actionStatus.action.status === 'errored') {
-        throw new Error('Snapshot creation failed');
-      }
-      attempts++;
-    }
-    
-    if (!snapshotComplete) {
-      throw new Error('Snapshot creation timed out');
-    }
-    
-    // Get snapshot ID
-    const snapshots = await doApiCall('/snapshots?resource_type=droplet');
-    const snapshot = snapshots.snapshots.find(s => s.name === snapshotName);
-    
-    if (!snapshot) {
-      throw new Error('Snapshot not found after creation');
-    }
-    
-    updateJobProgress(jobId, 'snapshot_found', `Snapshot ID: ${snapshot.id}`);
-    
-    // Step 2: Create new droplet from snapshot
+    // Step 2: Create new droplet from template snapshot
     updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
@@ -170,7 +127,7 @@ async function processJob(jobId) {
       name: dropletName,
       region: 'nyc3',
       size: 's-1vcpu-2gb',
-      image: snapshot.id,
+      image: parseInt(TEMPLATE_SNAPSHOT_ID),
       backups: false,
       ipv6: false,
       monitoring: true
@@ -257,13 +214,14 @@ async function processJob(jobId) {
       domain: fullDomain,
       dropletId: newDropletId,
       dropletIp,
-      snapshotId: snapshot.id,
-      wpAdminUrl: `http://${fullDomain}/wp-admin`,
+      templateSnapshotId: TEMPLATE_SNAPSHOT_ID,
+      wpAdminUrl: `https://${fullDomain}/wp-admin`,
+      httpUrl: `http://${fullDomain}`,
       wpAdminUser: 'clients@sheragency.com',
       siteAccessible,
       configNote: 'Site configuration can be completed manually via wp-admin',
-      sslStatus: 'pending',
-      sslNote: 'Wait 5-10 minutes for DNS propagation, then install SSL certificate.'
+      sslStatus: 'pre-installed',
+      sslNote: 'Wildcard SSL certificate (*.sherstaging.com) is pre-installed. HTTPS should work immediately after DNS propagates.'
     });
     
   } catch (error) {
@@ -483,11 +441,12 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.1-fixed-username-ssl',
+    version: '3.2-wildcard-ssl',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
-      hasFormPassword: !!FORM_PASSWORD
+      hasFormPassword: !!FORM_PASSWORD,
+      templateSnapshotId: TEMPLATE_SNAPSHOT_ID
     },
     stats: {
       totalJobs: jobs.size,
@@ -500,10 +459,12 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.0 running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.2-wildcard-ssl running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
+  console.log(`Template snapshot: ${TEMPLATE_SNAPSHOT_ID} (with wildcard SSL pre-installed)`);
   console.log(`Environment check:`);
   console.log(`  - DO API Token: ${DO_API_TOKEN ? '✓' : '✗'}`);
   console.log(`  - Form Password: ${FORM_PASSWORD ? '✓' : '✗'}`);
-  console.log(`\nNote: Sites are created from template and ready to configure manually.`);
+  console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
+  console.log(`HTTPS will work automatically after DNS propagation.`);
 });
