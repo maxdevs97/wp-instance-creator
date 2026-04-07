@@ -2,7 +2,65 @@ const express = require('express');
 const fetch = require('node-fetch');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { Client: SshClient } = require('ssh2');
+const fs = require('fs');
 require('dotenv').config();
+
+// SSH key for forge-key (DO key ID 54026256) - must match the key added to droplets
+const SSH_PRIVATE_KEY_PATH = process.env.SSH_PRIVATE_KEY_PATH || '/etc/ssh-keys/forge-key';
+
+// Execute a command on a remote droplet via SSH and return stdout
+function sshExec(host, command, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const conn = new SshClient();
+    let output = '';
+    let errOutput = '';
+
+    const timer = setTimeout(() => {
+      conn.end();
+      reject(new Error(`SSH command timed out after ${timeoutMs}ms: ${command.slice(0, 80)}`));
+    }, timeoutMs);
+
+    conn.on('ready', () => {
+      conn.exec(command, (err, stream) => {
+        if (err) { clearTimeout(timer); conn.end(); return reject(err); }
+        stream.on('close', (code) => {
+          clearTimeout(timer);
+          conn.end();
+          if (code !== 0) {
+            reject(new Error(`SSH command exited ${code}: ${errOutput.slice(0, 300)}`));
+          } else {
+            resolve(output.trim());
+          }
+        });
+        stream.on('data', d => { output += d; });
+        stream.stderr.on('data', d => { errOutput += d; });
+      });
+    });
+
+    conn.on('error', (err) => { clearTimeout(timer); reject(err); });
+
+    const connectConfig = {
+      host,
+      port: 22,
+      username: 'root',
+      readyTimeout: 30000,
+    };
+
+    // Try private key file first, fallback to env var
+    try {
+      connectConfig.privateKey = fs.readFileSync(SSH_PRIVATE_KEY_PATH);
+    } catch {
+      if (process.env.SSH_PRIVATE_KEY) {
+        connectConfig.privateKey = process.env.SSH_PRIVATE_KEY.replace(/\\n/g, '\n');
+      } else {
+        return reject(new Error('No SSH private key configured (SSH_PRIVATE_KEY_PATH or SSH_PRIVATE_KEY env var)'));
+      }
+    }
+
+    conn.connect(connectConfig);
+  });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -292,6 +350,49 @@ runcmd:
       updateJobProgress(jobId, 'verify_warning', `⚠ Site check failed: ${error.message}`);
     }
     
+    // Step 6: Fix WordPress database URLs (search-replace snapshot domain → real domain)
+    updateJobProgress(jobId, 'wp_url_fix_start', `Fixing WordPress database URLs: snapshot domain → ${fullDomain}...`);
+    let wpUrlFixed = false;
+    let wpUrlNote = '';
+    try {
+      // Wait a bit for SSH to be ready after droplet boot
+      await sleep(15000);
+
+      // Detect the old domain baked into the snapshot DB
+      const getOldUrl = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'unknown'`;
+      const oldUrl = await sshExec(dropletIp, getOldUrl, 30000);
+      const oldDomain = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      updateJobProgress(jobId, 'wp_url_fix_detect', `Detected snapshot siteurl: ${oldUrl}`);
+
+      if (oldDomain && oldDomain !== fullDomain && oldDomain !== 'unknown') {
+        // Run search-replace across all tables
+        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${oldDomain}' '${fullDomain}' --all-tables 2>&1 | tail -5`;
+        const srResult = await sshExec(dropletIp, searchReplace, 60000);
+        updateJobProgress(jobId, 'wp_url_fix_replaced', `search-replace complete: ${srResult.slice(0, 200)}`);
+
+        // Force siteurl + home to HTTPS
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1`, 20000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1`, 20000);
+
+        // Flush cache
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1`, 15000);
+
+        wpUrlFixed = true;
+        wpUrlNote = `Replaced '${oldDomain}' → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}.`;
+        updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
+      } else if (oldDomain === fullDomain) {
+        wpUrlFixed = true;
+        wpUrlNote = 'siteurl already correct — no replacement needed.';
+        updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
+      } else {
+        wpUrlNote = `Could not detect old domain (got: '${oldUrl}'). Manual search-replace may be needed.`;
+        updateJobProgress(jobId, 'wp_url_fix_warning', `⚠ ${wpUrlNote}`);
+      }
+    } catch (sshErr) {
+      wpUrlNote = `SSH/WP-CLI step failed: ${sshErr.message}. Run manually: wp search-replace '<old-domain>' '${fullDomain}' --all-tables`;
+      updateJobProgress(jobId, 'wp_url_fix_warning', `⚠ ${wpUrlNote}`);
+    }
+
     // Complete job
     completeJob(jobId, {
       domain: fullDomain,
@@ -304,7 +405,9 @@ runcmd:
       httpUrl: `http://${fullDomain}`,
       wpAdminUser: 'clients@sheragency.com',
       siteAccessible,
-      configNote: 'Site configuration can be completed manually via wp-admin',
+      wpUrlFixed,
+      wpUrlNote,
+      configNote: 'WordPress database URLs auto-corrected to new domain during provisioning.',
       sslStatus: 'pre-installed',
       sslNote: 'Wildcard SSL certificate (*.sherstaging.com) is pre-installed. HTTPS should work immediately after DNS propagates.'
     });
