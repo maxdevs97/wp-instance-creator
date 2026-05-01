@@ -1,9 +1,9 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
 const { Client: SshClient } = require('ssh2');
 const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 // SSH key for forge-key (DO key ID 54026256) - must match the key added to droplets
@@ -355,12 +355,40 @@ runcmd:
     let wpUrlFixed = false;
     let wpUrlNote = '';
     try {
-      // Wait a bit for SSH to be ready after droplet boot
+      // Initial wait for SSH to be ready after droplet boot
       await sleep(15000);
+
+      // Poll for Docker container readiness (up to 2 minutes)
+      let containerReady = false;
+      const maxContainerAttempts = 12; // 12 * 10s = 2 minutes
+      for (let attempt = 1; attempt <= maxContainerAttempts; attempt++) {
+        updateJobProgress(jobId, 'wp_url_fix_docker_wait', `Waiting for WordPress container to start... (attempt ${attempt}/12)`);
+        try {
+          const containerName = await sshExec(
+            dropletIp,
+            `docker ps --filter name=wordpress --filter status=running --format '{{.Names}}' 2>/dev/null | head -1`,
+            30000
+          );
+          if (containerName && containerName.trim()) {
+            containerReady = true;
+            updateJobProgress(jobId, 'wp_url_fix_docker_ready', `WordPress container is running: ${containerName.trim()}`);
+            break;
+          }
+        } catch (err) {
+          console.warn(`Container check attempt ${attempt} failed: ${err.message}`);
+        }
+        if (attempt < maxContainerAttempts) {
+          await sleep(10000);
+        }
+      }
+
+      if (!containerReady) {
+        throw new Error('WordPress container did not start within 2 minutes');
+      }
 
       // Detect the old domain baked into the snapshot DB
       const getOldUrl = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'unknown'`;
-      const oldUrl = await sshExec(dropletIp, getOldUrl, 30000);
+      const oldUrl = await sshExec(dropletIp, getOldUrl, 60000);
       const oldDomain = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
       updateJobProgress(jobId, 'wp_url_fix_detect', `Detected snapshot siteurl: ${oldUrl}`);
 
