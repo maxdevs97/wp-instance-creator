@@ -386,9 +386,24 @@ runcmd:
         throw new Error('WordPress container did not start within 2 minutes');
       }
 
-      // Detect the old domain baked into the snapshot DB
-      const getOldUrl = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'unknown'`;
-      const oldUrl = await sshExec(dropletIp, getOldUrl, 60000);
+      // Poll until WP-CLI is ready (WordPress DB fully initialized inside container)
+      let oldUrl = 'unknown';
+      const maxWpCliAttempts = 18; // 18 * 10s = 3 minutes
+      for (let wpAttempt = 1; wpAttempt <= maxWpCliAttempts; wpAttempt++) {
+        updateJobProgress(jobId, 'wp_url_fix_wpcli_wait', `Waiting for WP-CLI to be ready... (attempt ${wpAttempt}/${maxWpCliAttempts})`);
+        try {
+          const tryUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'not_ready'`, 20000);
+          if (tryUrl && tryUrl.trim() && tryUrl.trim() !== 'not_ready' && tryUrl.trim().startsWith('http')) {
+            oldUrl = tryUrl.trim();
+            break;
+          }
+        } catch (wpCliErr) {
+          console.warn(`WP-CLI check attempt ${wpAttempt} failed: ${wpCliErr.message}`);
+        }
+        if (wpAttempt < maxWpCliAttempts) {
+          await sleep(10000);
+        }
+      }
       const oldDomain = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
       updateJobProgress(jobId, 'wp_url_fix_detect', `Detected snapshot siteurl: ${oldUrl}`);
 
