@@ -280,7 +280,7 @@ runcmd:
     updateJobProgress(jobId, 'droplet_waiting', 'Waiting for droplet to become active...');
     let dropletActive = false;
     const maxAttempts = 60; // 10 minutes max (60 attempts * 10 seconds)
-    attempts = 0;
+    let attempts = 0;
     let dropletIp = null;
     
     while (!dropletActive && attempts < maxAttempts) {
@@ -355,12 +355,14 @@ runcmd:
     let wpUrlFixed = false;
     let wpUrlNote = '';
     try {
-      // Initial wait for SSH to be ready after droplet boot
-      await sleep(15000);
+      // Initial wait for SSH + Docker to be ready after droplet boot
+      // DO droplets cloned from snapshots with Docker take ~60-90s before containers start
+      updateJobProgress(jobId, 'wp_url_fix_boot_wait', 'Waiting 90s for droplet boot + Docker startup...');
+      await sleep(90000);
 
-      // Poll for Docker container readiness (up to 2 minutes)
+      // Poll for Docker container readiness (up to 3 minutes)
       let containerReady = false;
-      const maxContainerAttempts = 12; // 12 * 10s = 2 minutes
+      const maxContainerAttempts = 18; // 18 * 10s = 3 minutes
       for (let attempt = 1; attempt <= maxContainerAttempts; attempt++) {
         updateJobProgress(jobId, 'wp_url_fix_docker_wait', `Waiting for WordPress container to start... (attempt ${attempt}/12)`);
         try {
@@ -388,7 +390,7 @@ runcmd:
 
       // Poll until WP-CLI is ready (WordPress DB fully initialized inside container)
       let oldUrl = 'unknown';
-      const maxWpCliAttempts = 18; // 18 * 10s = 3 minutes
+      const maxWpCliAttempts = 24; // 24 * 10s = 4 minutes
       for (let wpAttempt = 1; wpAttempt <= maxWpCliAttempts; wpAttempt++) {
         updateJobProgress(jobId, 'wp_url_fix_wpcli_wait', `Waiting for WP-CLI to be ready... (attempt ${wpAttempt}/${maxWpCliAttempts})`);
         try {
