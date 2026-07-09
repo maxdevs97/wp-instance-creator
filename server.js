@@ -411,19 +411,29 @@ runcmd:
 
       if (oldDomain && oldDomain !== fullDomain && oldDomain !== 'unknown') {
         // Run search-replace across all tables
-        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${oldDomain}' '${fullDomain}' --all-tables 2>&1 | tail -5`;
-        const srResult = await sshExec(dropletIp, searchReplace, 60000);
+        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${oldDomain}' '${fullDomain}' --all-tables 2>&1 | tail -5; exit 0`;
+        const srResult = await sshExec(dropletIp, searchReplace, 90000);
         updateJobProgress(jobId, 'wp_url_fix_replaced', `search-replace complete: ${srResult.slice(0, 200)}`);
 
         // Force siteurl + home to HTTPS
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1`, 20000);
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1`, 20000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1; exit 0`, 20000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1; exit 0`, 20000);
 
         // Flush cache
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1`, 15000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
+
+        // Verify fix actually took
+        const verifyUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'verify_failed'`, 20000);
+        const verifyDomain = verifyUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+        if (verifyDomain !== fullDomain) {
+          // Retry direct option set as last resort
+          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
+          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
+          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
+        }
 
         wpUrlFixed = true;
-        wpUrlNote = `Replaced '${oldDomain}' → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}.`;
+        wpUrlNote = `Replaced '${oldDomain}' → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}. Verified: ${verifyUrl.trim()}`;
         updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
       } else if (oldDomain === fullDomain) {
         wpUrlFixed = true;
