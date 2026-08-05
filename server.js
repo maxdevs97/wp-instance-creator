@@ -406,43 +406,48 @@ runcmd:
           await sleep(10000);
         }
       }
-      const oldDomain = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const oldUrl_detected = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
       updateJobProgress(jobId, 'wp_url_fix_detect', `Detected snapshot siteurl: ${oldUrl}`);
 
-      if (oldDomain && oldDomain !== fullDomain && oldDomain !== 'unknown') {
-        // Run search-replace across all tables
-        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${oldDomain}' '${fullDomain}' --all-tables 2>&1 | tail -5; exit 0`;
-        const srResult = await sshExec(dropletIp, searchReplace, 90000);
-        updateJobProgress(jobId, 'wp_url_fix_replaced', `search-replace complete: ${srResult.slice(0, 200)}`);
-
-        // Force siteurl + home to HTTPS
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1; exit 0`, 20000);
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1; exit 0`, 20000);
-
-        // Flush cache
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
-
-        // Verify fix actually took
-        const verifyUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'verify_failed'`, 20000);
-        const verifyDomain = verifyUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
-        if (verifyDomain !== fullDomain) {
-          // Retry direct option set as last resort
-          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
-          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
-          await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
-        }
-
-        wpUrlFixed = true;
-        wpUrlNote = `Replaced '${oldDomain}' → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}. Verified: ${verifyUrl.trim()}`;
-        updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
-      } else if (oldDomain === fullDomain) {
-        wpUrlFixed = true;
-        wpUrlNote = 'siteurl already correct — no replacement needed.';
-        updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
-      } else {
-        wpUrlNote = `Could not detect old domain (got: '${oldUrl}'). Manual search-replace may be needed.`;
-        updateJobProgress(jobId, 'wp_url_fix_warning', `⚠ ${wpUrlNote}`);
+      // Always replace the known template domain (mbstest1.sherstaging.com) regardless of
+      // what WP-CLI reports. WP-CLI may return the correct domain during polling if options
+      // were already set, but other tables (yoast, postmeta, etc.) and the options themselves
+      // can still contain the template URL. Skipping search-replace when siteurl looks correct
+      // is the root cause of the redirect bug.
+      const TEMPLATE_DOMAIN = 'mbstest1.sherstaging.com';
+      const domainsToReplace = new Set([TEMPLATE_DOMAIN]);
+      if (oldUrl_detected && oldUrl_detected !== fullDomain && oldUrl_detected !== 'unknown') {
+        domainsToReplace.add(oldUrl_detected);
       }
+
+      let srResults = [];
+      for (const domain of domainsToReplace) {
+        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${domain}' '${fullDomain}' --all-tables 2>&1 | tail -5; exit 0`;
+        const srResult = await sshExec(dropletIp, searchReplace, 90000);
+        srResults.push(`'${domain}': ${srResult.slice(0, 150)}`);
+        updateJobProgress(jobId, 'wp_url_fix_replaced', `search-replace '${domain}' → '${fullDomain}': ${srResult.slice(0, 150)}`);
+      }
+
+      // Force siteurl + home to HTTPS
+      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1; exit 0`, 20000);
+      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1; exit 0`, 20000);
+
+      // Flush cache
+      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
+
+      // Verify fix actually took
+      const verifyUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'verify_failed'`, 20000);
+      const verifyDomain = verifyUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+      if (verifyDomain !== fullDomain) {
+        // Retry direct option set as last resort
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
+        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
+      }
+
+      wpUrlFixed = true;
+      wpUrlNote = `Replaced template domain(s) [${Array.from(domainsToReplace).join(', ')}] → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}. Verified: ${verifyUrl.trim()}.`;
+      updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
     } catch (sshErr) {
       wpUrlNote = `SSH/WP-CLI step failed: ${sshErr.message}. Run manually: wp search-replace '<old-domain>' '${fullDomain}' --all-tables`;
       updateJobProgress(jobId, 'wp_url_fix_warning', `⚠ ${wpUrlNote}`);
