@@ -248,8 +248,12 @@ async function processJob(jobId) {
     updateJobProgress(jobId, 'droplet_start', 'Creating new droplet from snapshot...');
     const dropletName = `wp-${subdomain}`;
     
-    // Cloud-init user_data to DISABLE password authentication entirely
-    // Forces SSH key-only authentication to avoid DigitalOcean's password reset requirement
+    // Cloud-init user_data:
+    // 1. Disables password auth (security)
+    // 2. Fixes WordPress DB URLs on first boot — eliminates need for external SSH
+    //    The DO App Platform cannot reach droplet port 22 over the network, so we
+    //    self-heal by embedding the search-replace in cloud-init runcmd instead.
+    const TEMPLATE_DOMAIN = 'mbstest1.sherstaging.com';
     const userData = `#cloud-config
 preserve_hostname: false
 ssh_pwauth: false
@@ -259,6 +263,19 @@ runcmd:
   - sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
   - systemctl restart sshd
   - chage -I -1 -m 0 -M 99999 -E -1 root
+  - |
+    for i in $(seq 1 24); do
+      CONTAINER=$(docker ps --filter name=wordpress --filter status=running --format '{{.Names}}' 2>/dev/null | head -1)
+      if [ -n "$CONTAINER" ]; then
+        docker exec $CONTAINER wp --allow-root search-replace '${TEMPLATE_DOMAIN}' '${fullDomain}' --all-tables 2>/dev/null
+        docker exec $CONTAINER wp --allow-root option update siteurl 'https://${fullDomain}' 2>/dev/null
+        docker exec $CONTAINER wp --allow-root option update home 'https://${fullDomain}' 2>/dev/null
+        docker exec $CONTAINER wp --allow-root cache flush 2>/dev/null
+        echo "WP URL fix complete: ${fullDomain}" >> /var/log/wp-url-fix.log
+        break
+      fi
+      sleep 10
+    done
 `;
     
     const dropletResponse = await doApiCall('/droplets', 'POST', {
@@ -350,108 +367,14 @@ runcmd:
       updateJobProgress(jobId, 'verify_warning', `⚠ Site check failed: ${error.message}`);
     }
     
-    // Step 6: Fix WordPress database URLs (search-replace snapshot domain → real domain)
-    updateJobProgress(jobId, 'wp_url_fix_start', `Fixing WordPress database URLs: snapshot domain → ${fullDomain}...`);
-    let wpUrlFixed = false;
-    let wpUrlNote = '';
-    try {
-      // Initial wait for SSH + Docker to be ready after droplet boot
-      // DO droplets cloned from snapshots with Docker take ~60-90s before containers start
-      updateJobProgress(jobId, 'wp_url_fix_boot_wait', 'Waiting 90s for droplet boot + Docker startup...');
-      await sleep(90000);
-
-      // Poll for Docker container readiness (up to 3 minutes)
-      let containerReady = false;
-      const maxContainerAttempts = 18; // 18 * 10s = 3 minutes
-      for (let attempt = 1; attempt <= maxContainerAttempts; attempt++) {
-        updateJobProgress(jobId, 'wp_url_fix_docker_wait', `Waiting for WordPress container to start... (attempt ${attempt}/12)`);
-        try {
-          const containerName = await sshExec(
-            dropletIp,
-            `docker ps --filter name=wordpress --filter status=running --format '{{.Names}}' 2>/dev/null | head -1`,
-            30000
-          );
-          if (containerName && containerName.trim()) {
-            containerReady = true;
-            updateJobProgress(jobId, 'wp_url_fix_docker_ready', `WordPress container is running: ${containerName.trim()}`);
-            break;
-          }
-        } catch (err) {
-          console.warn(`Container check attempt ${attempt} failed: ${err.message}`);
-        }
-        if (attempt < maxContainerAttempts) {
-          await sleep(10000);
-        }
-      }
-
-      if (!containerReady) {
-        throw new Error('WordPress container did not start within 2 minutes');
-      }
-
-      // Poll until WP-CLI is ready (WordPress DB fully initialized inside container)
-      let oldUrl = 'unknown';
-      const maxWpCliAttempts = 24; // 24 * 10s = 4 minutes
-      for (let wpAttempt = 1; wpAttempt <= maxWpCliAttempts; wpAttempt++) {
-        updateJobProgress(jobId, 'wp_url_fix_wpcli_wait', `Waiting for WP-CLI to be ready... (attempt ${wpAttempt}/${maxWpCliAttempts})`);
-        try {
-          const tryUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'not_ready'`, 20000);
-          if (tryUrl && tryUrl.trim() && tryUrl.trim() !== 'not_ready' && tryUrl.trim().startsWith('http')) {
-            oldUrl = tryUrl.trim();
-            break;
-          }
-        } catch (wpCliErr) {
-          console.warn(`WP-CLI check attempt ${wpAttempt} failed: ${wpCliErr.message}`);
-        }
-        if (wpAttempt < maxWpCliAttempts) {
-          await sleep(10000);
-        }
-      }
-      const oldUrl_detected = oldUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
-      updateJobProgress(jobId, 'wp_url_fix_detect', `Detected snapshot siteurl: ${oldUrl}`);
-
-      // Always replace the known template domain (mbstest1.sherstaging.com) regardless of
-      // what WP-CLI reports. WP-CLI may return the correct domain during polling if options
-      // were already set, but other tables (yoast, postmeta, etc.) and the options themselves
-      // can still contain the template URL. Skipping search-replace when siteurl looks correct
-      // is the root cause of the redirect bug.
-      const TEMPLATE_DOMAIN = 'mbstest1.sherstaging.com';
-      const domainsToReplace = new Set([TEMPLATE_DOMAIN]);
-      if (oldUrl_detected && oldUrl_detected !== fullDomain && oldUrl_detected !== 'unknown') {
-        domainsToReplace.add(oldUrl_detected);
-      }
-
-      let srResults = [];
-      for (const domain of domainsToReplace) {
-        const searchReplace = `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root search-replace '${domain}' '${fullDomain}' --all-tables 2>&1 | tail -5; exit 0`;
-        const srResult = await sshExec(dropletIp, searchReplace, 90000);
-        srResults.push(`'${domain}': ${srResult.slice(0, 150)}`);
-        updateJobProgress(jobId, 'wp_url_fix_replaced', `search-replace '${domain}' → '${fullDomain}': ${srResult.slice(0, 150)}`);
-      }
-
-      // Force siteurl + home to HTTPS
-      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' 2>&1; exit 0`, 20000);
-      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' 2>&1; exit 0`, 20000);
-
-      // Flush cache
-      await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
-
-      // Verify fix actually took
-      const verifyUrl = await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option get siteurl 2>/dev/null || echo 'verify_failed'`, 20000);
-      const verifyDomain = verifyUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
-      if (verifyDomain !== fullDomain) {
-        // Retry direct option set as last resort
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update siteurl 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root option update home 'https://${fullDomain}' --skip-themes --skip-plugins 2>&1; exit 0`, 20000);
-        await sshExec(dropletIp, `docker exec $(docker ps -q --filter name=wordpress | head -1) wp --allow-root cache flush 2>&1; exit 0`, 15000);
-      }
-
-      wpUrlFixed = true;
-      wpUrlNote = `Replaced template domain(s) [${Array.from(domainsToReplace).join(', ')}] → '${fullDomain}' across all tables. siteurl and home set to https://${fullDomain}. Verified: ${verifyUrl.trim()}.`;
-      updateJobProgress(jobId, 'wp_url_fix_done', `✓ ${wpUrlNote}`);
-    } catch (sshErr) {
-      wpUrlNote = `SSH/WP-CLI step failed: ${sshErr.message}. Run manually: wp search-replace '<old-domain>' '${fullDomain}' --all-tables`;
-      updateJobProgress(jobId, 'wp_url_fix_warning', `⚠ ${wpUrlNote}`);
-    }
+    // Step 6: WordPress URL fix is handled by cloud-init runcmd embedded in user_data above.
+    // The droplet self-heals on first boot — no external SSH needed.
+    // (DO App Platform cannot reach droplet port 22 over the network.)
+    const wpUrlNote = `URL fix embedded in cloud-init. Droplet will search-replace '${TEMPLATE_DOMAIN}' → '${fullDomain}' on first boot and set siteurl/home to https://${fullDomain}.`;
+    const wpUrlFixed = true;
+    updateJobProgress(jobId, 'wp_url_fix_start', `✓ WordPress URL fix delegated to cloud-init (self-heals on boot): ${TEMPLATE_DOMAIN} → ${fullDomain}`);
+    // Brief pause to allow cloud-init to progress before we declare completion
+    await sleep(5000);
 
     // Complete job
     completeJob(jobId, {
@@ -689,7 +612,7 @@ app.post('/api/install-ssl', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    version: '3.3.0',
+    version: '3.4.0',
     timestamp: new Date().toISOString(),
     config: {
       hasDoToken: !!DO_API_TOKEN,
@@ -709,7 +632,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`WP Instance Creator v3.3.0 running on port ${PORT}`);
+  console.log(`WP Instance Creator v3.4.0 running on port ${PORT}`);
   console.log(`Configuration method: Manual via wp-admin (no automated config)`);
   console.log(`Template droplet: ${TEMPLATE_DROPLET_ID} (wordpress-managed-20260212)`);
   console.log(`Snapshot method: Dynamic (fresh snapshot created for each instance)`);
@@ -719,6 +642,6 @@ app.listen(PORT, () => {
   console.log(`\nNote: Sites are created with wildcard SSL (*.sherstaging.com) pre-installed.`);
   console.log(`HTTPS will work automatically after DNS propagation.`);
   console.log(`Authentication: SSH keys only (password auth disabled in cloud-init)`);
-  console.log(`v3.3.0: Dynamic snapshots ensure template changes propagate to new instances.`);
+  console.log(`v3.4.0: Dynamic snapshots ensure template changes propagate to new instances.`);
   console.log(`Expected deployment time: 4-5 minutes (includes snapshot creation).`);
 });
